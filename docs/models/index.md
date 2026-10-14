@@ -19,6 +19,13 @@ Text-to-video recipe for WAN 2.2 A14B on Trainium.
 Image-to-video recipe for WAN 2.2 A14B on Trainium.
 :::
 
+:::{grid-item-card} Qwen-Image-2.1
+:link: qwen-image-2.1
+:link-type: doc
+
+Text-to-image recipe for Qwen-Image-2.1 on Trainium.
+:::
+
 ::::
 
 :::{toctree}
@@ -27,4 +34,5 @@ Image-to-video recipe for WAN 2.2 A14B on Trainium.
 
 WAN 2.2 T2V <wan22-t2v-14b>
 WAN 2.2 I2V <wan22-i2v-14b>
+Qwen-Image-2.1 <qwen-image-2.1>
 :::

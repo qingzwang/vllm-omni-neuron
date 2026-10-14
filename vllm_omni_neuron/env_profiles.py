@@ -98,3 +98,5 @@ class Wan22EnvProfile:
 
 WAN22_T2V = Wan22EnvProfile()
 WAN22_I2V = Wan22EnvProfile()
+# Qwen-Image 2.1 runs on the same compiler/runtime settings as Wan2.2.
+QWEN_IMAGE21_T2I = Wan22EnvProfile()

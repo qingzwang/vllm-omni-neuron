@@ -1,0 +1,18 @@
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0-7"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: QwenImage21Pipeline
+      model_stage: diffusion
+      dtype: bfloat16
+      model_config:
+        # Static number of prompt tokens (after the system prompt) in the compiled graphs.
+        max_text_tokens: 512
+      parallel_config:
+        tensor_parallel_size: 8

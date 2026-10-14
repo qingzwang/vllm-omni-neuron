@@ -1,1 +1,7 @@
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product includes software derived from diffusers
+(https://github.com/huggingface/diffusers), licensed under the Apache License,
+Version 2.0. Copyright 2026 The Qwen Team and The HuggingFace Team.
+  - vllm_omni_neuron/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
+    (decoder of AutoencoderKLQwenImage21, huggingface/diffusers@916a5791)
