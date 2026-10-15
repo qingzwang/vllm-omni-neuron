@@ -13,14 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Decoder half of diffusers' AutoencoderKLQwenImage21
+# Single-frame port of diffusers' AutoencoderKLQwenImage21
 # (huggingface/diffusers@916a5791, src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py),
 # which is not in the diffusers release pinned by vllm-omni.
 #
 # Neuron-specific changes
-# 1. Decoder only: the encoder, quant_conv and tiling are dropped (text-to-image never
-#    encodes). Encoder weights in the checkpoint are ignored at load.
-# 2. Single-frame decode without the feature cache. An image is one latent frame, which
+# 1. Single frame only, no diffusers tiling. The encoder (for edit condition images)
+#    returns the posterior mode, as the edit pipeline's ``sample_mode="argmax"`` does.
+# 2. Single-frame encode/decode without the feature cache. An image is one latent frame, which
 #    the reference decodes as its first chunk: every causal conv sees no cache, every
 #    temporal upsample takes the "Rep" path (time_conv skipped) and every DupUp3D
 #    shortcut keeps only its last frame. That path is reproduced statically, so the whole
@@ -114,21 +114,49 @@ class QwenImage21Upsample(nn.Module):
         return x.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
 
 
+class QwenImage21AvgDown3D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, factor_t: int, factor_s: int = 1):
+        super().__init__()
+        self.out_channels = out_channels
+        self.factor_t = factor_t
+        self.factor_s = factor_s
+        self.factor = factor_t * factor_s * factor_s
+        assert in_channels * self.factor % out_channels == 0
+        self.group_size = in_channels * self.factor // out_channels
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pad_t = (self.factor_t - x.shape[2] % self.factor_t) % self.factor_t
+        x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+        b, c, t, h, w = x.shape
+        ft, fs = self.factor_t, self.factor_s
+        x = x.view(b, c, t // ft, ft, h // fs, fs, w // fs, fs)
+        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
+        x = x.view(b, self.out_channels, self.group_size, t // ft, h // fs, w // fs)
+        return x.mean(dim=2)
+
+
 class QwenImage21Resample(nn.Module):
-    """Upsampling resample. ``time_conv`` exists for checkpoint compatibility only."""
+    """2x spatial resample. ``time_conv`` exists for checkpoint compatibility only: a
+    single frame never reaches it (the reference skips it on the first chunk)."""
 
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None):
         super().__init__()
         self.mode = mode
-        upsample_out_dim = upsample_out_dim or dim // 2
-        if mode not in ("upsample2d", "upsample3d"):
-            raise ValueError(f"decoder-only resample does not support mode={mode!r}")
-        self.resample = nn.Sequential(
-            QwenImage21Upsample(), nn.Conv2d(dim, upsample_out_dim, 3, padding=1)
-        )
-        if mode == "upsample3d":
-            # Unused on the first (only) frame: the reference skips it via the "Rep" cache.
-            self.time_conv = QwenImage21CausalConv3d(dim, dim * 2, (1, 1), padding=(0, 0))
+        if mode in ("upsample2d", "upsample3d"):
+            upsample_out_dim = upsample_out_dim or dim // 2
+            self.resample = nn.Sequential(
+                QwenImage21Upsample(), nn.Conv2d(dim, upsample_out_dim, 3, padding=1)
+            )
+            if mode == "upsample3d":
+                self.time_conv = QwenImage21CausalConv3d(dim, dim * 2, (1, 1), padding=(0, 0))
+        elif mode in ("downsample2d", "downsample3d"):
+            self.resample = nn.Sequential(
+                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=2)
+            )
+            if mode == "downsample3d":
+                self.time_conv = QwenImage21CausalConv3d(dim, dim, (1, 1), stride=(1, 1))
+        else:
+            raise ValueError(f"unsupported resample mode {mode!r}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, t, h, w = x.size()
@@ -212,6 +240,70 @@ class QwenImage21MidBlock(nn.Module):
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             x = resnet(attn(x))
         return x
+
+
+class QwenImage21ResidualDownBlock(nn.Module):
+    def __init__(
+        self, in_dim, out_dim, dropout, num_res_blocks, temperal_downsample=False, down_flag=False
+    ):
+        super().__init__()
+        self.avg_shortcut = QwenImage21AvgDown3D(
+            in_dim,
+            out_dim,
+            factor_t=2 if temperal_downsample else 1,
+            factor_s=2 if down_flag else 1,
+        )
+        resnets = []
+        for _ in range(num_res_blocks):
+            resnets.append(QwenImage21ResidualBlock(in_dim, out_dim, dropout))
+            in_dim = out_dim
+        self.resnets = nn.ModuleList(resnets)
+        if down_flag:
+            mode = "downsample3d" if temperal_downsample else "downsample2d"
+            self.downsampler = QwenImage21Resample(out_dim, mode=mode)
+        else:
+            self.downsampler = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_copy = x
+        for resnet in self.resnets:
+            x = resnet(x)
+        if self.downsampler is not None:
+            x = self.downsampler(x)
+        return x + self.avg_shortcut(x_copy)
+
+
+class QwenImage21Encoder3d(nn.Module):
+    def __init__(
+        self,
+        in_channels=4,
+        dim=96,
+        z_dim=128,
+        dim_mult=(1, 2, 4, 8, 8),
+        num_res_blocks=2,
+        temperal_downsample=(False, True, True, True),
+        dropout=0.0,
+    ):
+        super().__init__()
+        dim_mult = list(dim_mult)
+        dims = [dim * u for u in [1] + dim_mult]
+        self.conv_in = QwenImage21CausalConv3d(in_channels, dims[0], 3, padding=1)
+        self.down_blocks = nn.ModuleList(
+            [
+                QwenImage21ResidualDownBlock(
+                    in_dim,
+                    out_dim,
+                    dropout,
+                    num_res_blocks,
+                    temperal_downsample=temperal_downsample[i] if i != len(dim_mult) - 1 else False,
+                    down_flag=i != len(dim_mult) - 1,
+                )
+                for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:]))
+            ]
+        )
+        self.mid_block = QwenImage21MidBlock(dims[-1], dropout, num_layers=1)
+        self.norm_out = QwenImage21RMS_norm(dims[-1], images=False)
+        self.conv_out = QwenImage21CausalConv3d(dims[-1], z_dim, 3, padding=1)
 
 
 class QwenImage21ResidualUpBlock(nn.Module):
@@ -299,8 +391,6 @@ class NeuronAutoencoderKLQwenImage21(ModelMixin, ConfigMixin):
     matches the reference so the checkpoint config applies unchanged.
     """
 
-    _keys_to_ignore_on_load_unexpected = [r"^encoder\.", r"^quant_conv\."]
-
     @register_to_config
     def __init__(
         self,
@@ -324,6 +414,16 @@ class NeuronAutoencoderKLQwenImage21(ModelMixin, ConfigMixin):
         super().__init__()
         if not is_residual or patch_size is not None or attn_scales:
             raise NotImplementedError("only the Qwen-Image 2.1 VAE configuration is supported")
+        self.encoder = QwenImage21Encoder3d(
+            in_channels=in_channels,
+            dim=base_dim,
+            z_dim=z_dim * 2,
+            dim_mult=dim_mult,
+            num_res_blocks=num_res_blocks,
+            temperal_downsample=temperal_downsample,
+            dropout=dropout,
+        )
+        self.quant_conv = QwenImage21CausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.post_quant_conv = QwenImage21CausalConv3d(z_dim, z_dim, 1)
         self.decoder = QwenImage21Decoder3d(
             dim=decoder_base_dim or base_dim,
@@ -335,6 +435,34 @@ class NeuronAutoencoderKLQwenImage21(ModelMixin, ConfigMixin):
             out_channels=out_channels,
         )
         self._compiled_stages = None
+        self._compiled_encoder_stages = None
+
+    def _encode_head(self, x: torch.Tensor) -> torch.Tensor:
+        """Pixels ``[B, C, 1, H, W]`` in ``[-1, 1]`` → first down block output."""
+        x = x.to(self.post_quant_conv.weight.dtype)
+        return self.encoder.down_blocks[0](self.encoder.conv_in(x))
+
+    def _encode_tail(self, x: torch.Tensor) -> torch.Tensor:
+        """Last down block output → normalized latent mode (the posterior mean)."""
+        enc = self.encoder
+        x = enc.conv_out(F.silu(enc.norm_out(enc.mid_block(x))))
+        mean = self.quant_conv(x)[:, : self.config.z_dim]
+        latents_mean = torch.tensor(self.config.latents_mean, dtype=mean.dtype, device=mean.device)
+        latents_std = torch.tensor(self.config.latents_std, dtype=mean.dtype, device=mean.device)
+        return (mean - latents_mean.view(1, -1, 1, 1, 1)) / latents_std.view(1, -1, 1, 1, 1)
+
+    def _encoder_stages(self):
+        return [self._encode_head, *self.encoder.down_blocks[1:], self._encode_tail]
+
+    def encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        """Pixels ``[1, C, 1, H, W]`` → normalized latents ``[1, z_dim, 1, H/16, W/16]``.
+
+        The reference's ``_encode_vae_image`` with ``sample_mode="argmax"``: one frame,
+        the posterior mode, then ``(z - latents_mean) / latents_std``.
+        """
+        for stage in self._compiled_encoder_stages or self._encoder_stages():
+            x = stage(x)
+        return x
 
     def _decode_head(self, z: torch.Tensor) -> torch.Tensor:
         """Normalized latents → mid-block output."""
@@ -363,6 +491,12 @@ class NeuronAutoencoderKLQwenImage21(ModelMixin, ConfigMixin):
         self._compiled_stages = [
             torch.compile(stage, *args, options={**options, "model_name": f"{base}_{i}"}, **kwargs)
             for i, stage in enumerate(self._stages())
+        ]
+        self._compiled_encoder_stages = [
+            torch.compile(
+                stage, *args, options={**options, "model_name": f"{base}_enc{i}"}, **kwargs
+            )
+            for i, stage in enumerate(self._encoder_stages())
         ]
 
     @staticmethod

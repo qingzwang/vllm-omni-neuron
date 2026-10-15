@@ -67,6 +67,9 @@ from vllm_omni_neuron.diffusion.quantization.adaln_kernels import adaln_modulate
 logger = logging.getLogger(__name__)
 
 
+# The attention kernel reads per-query KV bounds in tiles of this many query rows.
+_BOUNDS_TILE = 128
+
 # Heads per fused QKV kernel call (see QwenImage21Attention.__init__).
 _MAX_QKV_KERNEL_HEADS = 4
 
@@ -148,6 +151,123 @@ def qwen_image21_rope(
     )
     text, image = torch.cat([text, text], dim=-1), torch.cat([image, image], dim=-1)
     return text.cos(), text.sin(), image.cos(), image.sin()
+
+
+@dataclass
+class EditLayout:
+    """Host-side layout of an edit prefix (see :func:`qwen_image21_edit_layout`)."""
+
+    gather_index: torch.Tensor  # [prefix_len] int64 into cat([text rows, condition latents])
+    bound_max: torch.Tensor  # [prefix_len] int32, exclusive key bound per prefix query
+    prefix_cos: torch.Tensor  # [prefix_len, D]
+    prefix_sin: torch.Tensor
+    target_cos: torch.Tensor  # [target tokens, D]
+    target_sin: torch.Tensor
+    valid_len: int  # unpadded prefix length
+
+
+def qwen_image21_edit_layout(
+    slot_mask: torch.Tensor,
+    text_rows: int,
+    condition_hw: list[tuple[int, int]],
+    target_hw: tuple[int, int],
+    axes_dim=(16, 56, 56),
+    theta: float = 10000.0,
+    multiple_of: int = _BOUNDS_TILE,
+) -> EditLayout:
+    """Joint text/condition-image prefix, following the reference.
+
+    ``slot_mask`` ``[L]`` marks the vision-language image slots among the ``L`` valid text
+    rows (after the system prompt); the rows are padded to ``text_rows``. Each slot stands
+    for a 2x2 group of condition latents, so the slots of condition image ``i`` (taken in
+    order, ``h_i * w_i / 4`` of them, as ``build_token_metadata`` counts them) become its
+    ``h_i * w_i`` latent tokens in raster order. The condition latents follow the text
+    rows in the gather source, concatenated in image order.
+
+    The mask is causal over text and bidirectional inside each image block; RoPE follows
+    ``QwenImage21Rope`` (text advances one position per token on all axes; an image block
+    freezes the frame axis, centres its h/w grid, and advances the position by
+    ``max(h, w)``); the target image comes after the prefix. Padded rows are appended
+    after the valid prefix (masked out as keys), up to a multiple of ``multiple_of``
+    positions (the attention kernel reads per-query bounds in 128-row tiles).
+    """
+    num_valid = int(slot_mask.shape[0])
+    slots = slot_mask.nonzero().flatten().tolist()
+    counts = [h * w // 4 for h, w in condition_hw]
+    if sum(counts) != len(slots) or any(h * w % 4 for h, w in condition_hw):
+        raise ValueError("image slots do not match the condition latent grids")
+
+    # Segments in sequence order: ("text", rows) or ("image", index).
+    segments, row, start = [], 0, 0
+    for index, count in enumerate(counts):
+        first = slots[start]
+        if slots[start : start + count] != list(range(first, first + count)):
+            raise ValueError(f"condition image {index}'s slots are not contiguous")
+        segments.append(("text", list(range(row, first))))
+        segments.append(("image", index))
+        row, start = first + count, start + count
+    segments.append(("text", list(range(row, num_valid))))
+
+    def grid(h, w):
+        hs = torch.arange(-(h - h // 2), h // 2)[:, None].expand(h, w).reshape(-1)
+        ws = torch.arange(-(w - w // 2), w // 2)[None, :].expand(h, w).reshape(-1)
+        return hs, ws
+
+    latent_offsets = [0]
+    for h, w in condition_hw:
+        latent_offsets.append(latent_offsets[-1] + h * w)
+
+    gather, bound, frame, hh, ww = [], [], [], [], []
+    pos = 0
+    for kind, value in segments:
+        if kind == "text":
+            gather += value
+            bound += [len(bound) + p + 1 for p in range(len(value))]
+            idx = torch.arange(pos, pos + len(value))
+            frame.append(idx), hh.append(idx), ww.append(idx)
+            pos += len(value)
+        else:
+            h, w = condition_hw[value]
+            gather += [text_rows + latent_offsets[value] + i for i in range(h * w)]
+            bound += [len(bound) + h * w] * (h * w)
+            hs, ws = grid(h, w)
+            frame.append(torch.full_like(hs, pos)), hh.append(hs), ww.append(ws)
+            pos += max(h, w)
+    valid_len = len(gather)
+    target_pos = pos
+
+    pad_rows = list(range(num_valid, text_rows))
+    pad_rows += [text_rows - 1] * (-(valid_len + len(pad_rows)) % multiple_of)
+    gather += pad_rows
+    bound += [len(bound) + p + 1 for p in range(len(pad_rows))]
+    idx = torch.arange(pos, pos + len(pad_rows))  # padding: any positions (masked as keys)
+    frame.append(idx), hh.append(idx), ww.append(idx)
+
+    def tables(f, h, w):
+        angles = torch.cat(
+            [
+                _axis_angles(f, axes_dim[0], theta),
+                _axis_angles(h, axes_dim[1], theta),
+                _axis_angles(w, axes_dim[2], theta),
+            ],
+            dim=-1,
+        )
+        angles = torch.cat([angles, angles], dim=-1)
+        return angles.cos(), angles.sin()
+
+    prefix_cos, prefix_sin = tables(torch.cat(frame), torch.cat(hh), torch.cat(ww))
+    th, tw = target_hw
+    hs, ws = grid(th, tw)
+    target_cos, target_sin = tables(torch.full_like(hs, target_pos), hs, ws)
+    return EditLayout(
+        gather_index=torch.tensor(gather, dtype=torch.int64),
+        bound_max=torch.tensor(bound, dtype=torch.int32),
+        prefix_cos=prefix_cos,
+        prefix_sin=prefix_sin,
+        target_cos=target_cos,
+        target_sin=target_sin,
+        valid_len=valid_len,
+    )
 
 
 def _rope_perm(head_dim: int) -> torch.Tensor:
@@ -393,12 +513,39 @@ class QwenImage21Attention(nn.Module):
             tp_out=True,
         )
 
-    def attend_bounded(self, q, k, v, kv_len: torch.Tensor) -> torch.Tensor:
-        """Full attention of ``q`` over the first ``kv_len`` keys of ``k``/``v``."""
+    def attend_prefix(self, q, k, v, bound_max: torch.Tensor) -> torch.Tensor:
+        """Query ``i`` attends to keys ``[0, bound_max[i])`` (block-causal prefix).
+
+        The prefix length must be a multiple of 128 (see :meth:`attend_bounded`).
+        """
         heads, seq_q, _ = q.shape
-        bound_max = kv_len.to(torch.int32).view(1, 1, 1).expand(heads, seq_q, 1).contiguous()
-        bound_min = torch.zeros_like(bound_max)
+        bound_max = bound_max.to(torch.int32).view(1, seq_q, 1).expand(heads, seq_q, 1).contiguous()
         return NF.flash_attention(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            scale=self.scale,
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            tp_out=True,
+            bound_min=torch.zeros_like(bound_max),
+            bound_max=bound_max,
+        )
+
+    def attend_bounded(self, q, k, v, kv_len: torch.Tensor) -> torch.Tensor:
+        """Full attention of ``q`` over the first ``kv_len`` keys of ``k``/``v``.
+
+        The kernel reads the per-query bounds in 128-row tiles, so the queries are padded
+        to a multiple of 128 and the padded output rows dropped.
+        """
+        heads, seq_q, _ = q.shape
+        pad = -seq_q % _BOUNDS_TILE
+        if pad:
+            q = F.pad(q, (0, 0, 0, pad))
+        bound_max = kv_len.to(torch.int32).view(1, 1, 1).expand(heads, seq_q + pad, 1).contiguous()
+        bound_min = torch.zeros_like(bound_max)
+        out = NF.flash_attention(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),
@@ -410,6 +557,7 @@ class QwenImage21Attention(nn.Module):
             bound_min=bound_min,
             bound_max=bound_max,
         )
+        return out[..., :seq_q] if pad else out
 
 
 class QwenImage21FeedForward(nn.Module):
@@ -455,19 +603,36 @@ class QwenImage21TransformerBlock(nn.Module):
         modulated = _layer_norm(hidden_states, self.eps) * (1 + scale2)
         return hidden_states + gate2.tanh() * self.img_mlp(modulated)
 
-    def forward_prefix(self, hidden_states, modulation, cos, sin, last: bool):
-        """Text pass: return this layer's text ``k, v`` and (unless ``last``) its output."""
+    def forward_prefix(self, hidden_states, modulation, cos, sin, last: bool, bound_max=None):
+        """Prefix pass: return this layer's prefix ``k, v`` and (unless ``last``) its output.
+
+        Text-only prefixes are causal; with ``bound_max`` (edit prefixes holding a
+        condition-image block) query ``i`` attends to keys ``[0, bound_max[i])``.
+        """
         scale1, gate1, scale2, gate2 = modulation
         modulated = _layer_norm(hidden_states, self.eps) * (1 + scale1)
         q, k, v = self.attn.project_qkv(modulated, cos, sin)
         if last:
             return None, k, v
-        attn = self.attn.project_out(self.attn.attend_causal(q, k, v))
+        if bound_max is None:
+            attn = self.attn.attend_causal(q, k, v)
+        else:
+            attn = self.attn.attend_prefix(q, k, v, bound_max)
+        attn = self.attn.project_out(attn)
         hidden_states = hidden_states + gate1.tanh() * attn
         return self._residual_mlp(hidden_states, scale2, gate2), k, v
 
     def attention_step(
-        self, modulated, cos, sin, text_k, text_v, kv_len, sequence_parallel, cp_group=None
+        self,
+        modulated,
+        cos,
+        sin,
+        text_k,
+        text_v,
+        kv_len,
+        sequence_parallel,
+        cp_group=None,
+        num_image_keys=None,
     ):
         """Image self-attention over ``[image K/V, cached text K/V]``.
 
@@ -475,7 +640,9 @@ class QwenImage21TransformerBlock(nn.Module):
         ``sequence_parallel``, else its whole (CP-local) image sequence. With a
         ``cp_group`` the queries stay local and the image K/V are all-gathered over it;
         the attention is bidirectional and RoPE is already applied, so the gathered
-        order does not matter.
+        order does not matter. ``num_image_keys`` (padded sequences) is the number of
+        real image tokens; the keys of the padding rows after them are moved behind the
+        text keys, outside the ``kv_len`` attended range.
         """
         if sequence_parallel:
             modulated = sp_all_gather_seq(modulated, self.attn.tp_group, self.attn.tp_size)
@@ -483,8 +650,14 @@ class QwenImage21TransformerBlock(nn.Module):
         if cp_group is not None:
             k = cp_group.all_gather(k.contiguous(), dim=1)
             v = cp_group.all_gather(v.contiguous(), dim=1)
-        k = torch.cat([k, text_k], dim=1)
-        v = torch.cat([v, text_v], dim=1)
+        if num_image_keys is None:
+            k = torch.cat([k, text_k], dim=1)
+            v = torch.cat([v, text_v], dim=1)
+        else:
+            # Padded image tokens: their keys go last, after the (valid) text keys.
+            n = num_image_keys
+            k = torch.cat([k[:, :n], text_k, k[:, n:]], dim=1)
+            v = torch.cat([v[:, :n], text_v, v[:, n:]], dim=1)
         return self.attn.project_out(self.attn.attend_bounded(q, k, v, kv_len), sequence_parallel)
 
 
@@ -585,15 +758,39 @@ class QwenImage21Transformer2DModel(nn.Module):
         """
         dtype = self.dtype
         text = encoder_hidden_states[:, self.text_offset : self.text_offset + self.text_buffer_len]
-        hidden_states = self.txt_in(text.to(dtype))
+        return self._prefix_blocks(self.txt_in(text.to(dtype)), cos, sin)
+
+    def forward_prefix_edit(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        condition_latents: torch.Tensor,
+        gather_index: torch.Tensor,
+        bound_max: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Edit prefix: text with the condition image's latent block → stacked K and V.
+
+        The joint sequence is ``cat([txt_in(text rows), img_in(condition latents)])``
+        gathered by ``gather_index`` (see :func:`qwen_image21_edit_layout`), so every
+        vision-language image slot becomes its 2x2 latent tokens in place.
+        """
+        dtype = self.dtype
+        text = encoder_hidden_states[:, self.text_offset :]
+        rows = torch.cat([self.txt_in(text.to(dtype)), self.img_in(condition_latents.to(dtype))], 1)
+        hidden_states = torch.index_select(rows, 1, gather_index)
+        return self._prefix_blocks(hidden_states, cos, sin, bound_max)
+
+    def _prefix_blocks(self, hidden_states, cos, sin, bound_max=None):
+        """Run the prefix through the blocks, modulated from ``t = 0``."""
+        dtype = self.dtype
         zero = torch.zeros(1, dtype=dtype, device=hidden_states.device)
         modulation = self._modulation(self.time_text_embed(zero, dtype))
-
         keys, values = [], []
         last = len(self.transformer_blocks) - 1
         for i, block in enumerate(self.transformer_blocks):
             hidden_states, k, v = block.forward_prefix(
-                hidden_states, modulation, cos, sin, last=i == last
+                hidden_states, modulation, cos, sin, last=i == last, bound_max=bound_max
             )
             keys.append(k)
             values.append(v)
@@ -641,9 +838,18 @@ class QwenImage21Transformer2DModel(nn.Module):
             cos, sin = cos[start : start + seq_len], sin[start : start + seq_len]
         # Sequence parallelism shards the token-wise work (norms, modulation, residuals,
         # embedders) across TP ranks; it needs the (CP-local) sequence to split evenly.
-        sp = self.sequence_parallel and self.tp_size > 1 and seq_len % self.tp_size == 0
+        # Without CP, a sequence that does not split evenly is padded with dummy image
+        # tokens; attention_step keeps their keys outside the attended range and the
+        # padded rows are dropped from the output.
+        sp = self.sequence_parallel and self.tp_size > 1
+        pad = -seq_len % self.tp_size if sp and self.cp_size == 1 else 0
+        sp = sp and (seq_len + pad) % self.tp_size == 0
+        if pad:
+            latents_local = F.pad(latents_local, (0, 0, 0, pad))
+            cos, sin = F.pad(cos, (0, 0, 0, pad)), F.pad(sin, (0, 0, 0, pad))
+        num_image_keys = seq_len if pad else None
         if sp:
-            local = seq_len // self.tp_size
+            local = (seq_len + pad) // self.tp_size
             latents_local = latents_local[:, self.tp_rank * local : (self.tp_rank + 1) * local]
         hidden_states = self.img_in(latents_local.to(dtype))
 
@@ -660,7 +866,7 @@ class QwenImage21Transformer2DModel(nn.Module):
         last = len(self.transformer_blocks) - 1
         for i, block in enumerate(self.transformer_blocks):
             attn = block.attention_step(
-                modulated, cos, sin, text_k[i], text_v[i], kv_len, sp, self.cp_group
+                modulated, cos, sin, text_k[i], text_v[i], kv_len, sp, self.cp_group, num_image_keys
             )
             hidden_states, modulated = _adaln(attn, mul2, eps, residual=hidden_states, gate=gate1)
             mlp = block.img_mlp(modulated, sp)
@@ -670,6 +876,8 @@ class QwenImage21Transformer2DModel(nn.Module):
         noise_pred = self.proj_out(modulated)
         if sp:
             noise_pred = sp_all_gather_seq(noise_pred, self.tp_group, self.tp_size)
+        if pad:
+            noise_pred = noise_pred[:, :seq_len]
         if self.cp_group is not None:
             noise_pred = self.cp_group.all_gather(noise_pred.contiguous(), dim=1)
         # FlowMatchEulerDiscreteScheduler.step: float32 update, cast back to the
@@ -681,9 +889,18 @@ class QwenImage21Transformer2DModel(nn.Module):
         self._compiled_prefix = torch.compile(
             self.forward_prefix, *args, options=prefix_options, **kwargs
         )
+        edit_options = {**(prefix_options or {})}
+        edit_options["model_name"] = f"{edit_options.get('model_name', 'prefix')}_edit"
+        self._compiled_prefix_edit = torch.compile(
+            self.forward_prefix_edit, *args, options=edit_options, **kwargs
+        )
         self._compiled_step = torch.compile(
             self.forward_step, *args, options=step_options, **kwargs
         )
+
+    def prefix_edit(self, *args):
+        fn = getattr(self, "_compiled_prefix_edit", None) or self.forward_prefix_edit
+        return fn(*args)
 
     def prefix(self, *args):
         fn = self._compiled_prefix if self._compiled_prefix is not None else self.forward_prefix

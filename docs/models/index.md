@@ -23,7 +23,7 @@ Image-to-video recipe for WAN 2.2 A14B on Trainium.
 :link: qwen-image-2.1
 :link-type: doc
 
-Text-to-image recipe for Qwen-Image-2.1 on Trainium.
+Text-to-image and image editing recipe for Qwen-Image-2.1 on Trainium.
 :::
 
 ::::

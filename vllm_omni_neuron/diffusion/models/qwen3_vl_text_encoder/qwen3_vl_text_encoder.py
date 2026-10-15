@@ -282,6 +282,7 @@ class NeuronQwen3VLTextEncoder(nn.Module):
         rope_theta = getattr(config, "rope_theta", None)
         if rope_theta is None:
             rope_theta = config.rope_parameters["rope_theta"]
+        self._rope_theta = rope_theta
         cos, sin = text_rope_cos_sin(seq_len, config.head_dim, rope_theta, dtype)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
@@ -345,13 +346,63 @@ class NeuronQwen3VLTextEncoder(nn.Module):
             hidden_states = layer(hidden_states, self.rope_cos, self.rope_sin)
         return hidden_states
 
+    def _encode_multimodal(
+        self,
+        inputs_embeds: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        deepstack: torch.Tensor,
+    ) -> torch.Tensor:
+        """Text+image pass: explicit (MRoPE) tables and DeepStack residuals.
+
+        ``deepstack`` ``[k, 1, L, H]`` holds each DeepStack feature at the image
+        positions and zeros elsewhere; layer ``i < k`` adds row ``i`` to its output, as
+        ``Qwen3VLTextModel._deepstack_process`` does at the visual positions.
+        """
+        hidden_states = inputs_embeds
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states, cos, sin)
+            if i < deepstack.shape[0]:
+                hidden_states = hidden_states + deepstack[i]
+        return hidden_states
+
     def compile(self, *args, **kwargs):
         self._compiled = torch.compile(self._encode, *args, **kwargs)
+        self._compiled_multimodal = torch.compile(self._encode_multimodal, *args, **kwargs)
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Host token embedding ``[1, L]`` → ``[1, L, H]``."""
+        return F.embedding(input_ids.cpu(), self._embed_tokens)
+
+    def mrope_cos_sin(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Interleaved-MRoPE tables ``[L, D]`` for ``(t, h, w)`` positions ``[3, L]``.
+
+        As ``Qwen3VLTextRotaryEmbedding``: frequency ``j`` takes its position from the
+        height axis when ``j % 3 == 1``, the width axis when ``j % 3 == 2`` (within the
+        sections), and the temporal axis otherwise.
+        """
+        head_dim = self.config.head_dim
+        rope = getattr(self.config, "rope_parameters", None) or self.config.rope_scaling
+        theta = self._rope_theta
+        section = rope.get("mrope_section", [24, 20, 20])
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        freqs = position_ids.float()[..., None] * inv_freq  # [3, L, D/2]
+        mixed = freqs[0].clone()
+        for axis in (1, 2):
+            idx = slice(axis, section[axis] * 3, 3)
+            mixed[..., idx] = freqs[axis][..., idx]
+        emb = torch.cat([mixed, mixed], dim=-1)
+        return emb.cos().to(self._dtype), emb.sin().to(self._dtype)
 
     def forward(self, input_ids: torch.Tensor, device: torch.device) -> _TextEncoderOutput:
         """Encode ``input_ids`` ``[1, seq_len]`` (host tensor) into ``[1, seq_len, H]`` on ``device``."""
         if input_ids.shape[-1] != self.seq_len:
             raise ValueError(f"expected {self.seq_len} tokens, got {input_ids.shape[-1]}")
-        inputs_embeds = F.embedding(input_ids.cpu(), self._embed_tokens).to(device)
+        inputs_embeds = self.embed(input_ids).to(device)
         fn = self._compiled if self._compiled is not None else self._encode
         return _TextEncoderOutput(fn(inputs_embeds))
+
+    def forward_multimodal(self, inputs_embeds, cos, sin, deepstack) -> _TextEncoderOutput:
+        """Device tensors from the caller (see :meth:`_encode_multimodal`), any length."""
+        fn = getattr(self, "_compiled_multimodal", None) or self._encode_multimodal
+        return _TextEncoderOutput(fn(inputs_embeds, cos, sin, deepstack))

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NeuronQwenImage21Pipeline — Qwen-Image 2.1 text-to-image pipeline for Neuron.
+"""NeuronQwenImage21Pipeline — Qwen-Image 2.1 text-to-image and edit pipeline for Neuron.
 
 vllm-omni 0.24 (and the diffusers release it pins) has no Qwen-Image 2.1 pipeline, so
 this is a standalone pipeline that mirrors diffusers' ``QwenImage21Pipeline`` for
-text-to-image without classifier-free guidance (the model is meant to be sampled
-without it). Per request:
+text-to-image and single-image editing without classifier-free guidance (the model is
+meant to be sampled without it). Per text-to-image request:
 
 1. Tokenize the prompt with the T2I chat template; the Qwen3-VL text encoder (TP,
    compiled) returns its pre-norm hidden states at a static length.
@@ -15,21 +15,30 @@ without it). Per request:
 4. The VAE decoder (compiled per stage) decodes the latents: on rank 0 up to a 64x64
    latent, above that as exact tiles spread over the TP ranks.
 
+An edit request (one condition image in ``multi_modal_data["image"]``) differs in steps
+1-2: the Qwen3-VL vision tower encodes the image for the language model (image tokens
+and DeepStack features, MRoPE positions), the VAE encoder turns it into a latent block,
+and the prefix graph runs text plus that block with a block-causal mask.
+
 Timesteps, sigmas, RoPE tables and the initial noise are computed on the host exactly
 as the reference does, so a seed gives the reference's starting point.
 """
 
 import logging
+import math
 import os
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from PIL import Image as PILImage
 from torch import nn
-from transformers import AutoProcessor
+from transformers import AutoConfig, AutoProcessor
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -41,8 +50,12 @@ from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_kl_qwenimag
 from vllm_omni_neuron.diffusion.models.qwen3_vl_text_encoder.qwen3_vl_text_encoder import (
     NeuronQwen3VLTextEncoder,
 )
+from vllm_omni_neuron.diffusion.models.qwen3_vl_text_encoder.qwen3_vl_vision_encoder import (
+    NeuronQwen3VLVisionEncoder,
+)
 from vllm_omni_neuron.diffusion.models.qwen_image_2_1.qwen_image_2_1_transformer import (
     QwenImage21Transformer2DModel,
+    qwen_image21_edit_layout,
     qwen_image21_rope,
 )
 from vllm_omni_neuron.lite_compat import is_lite_runtime
@@ -73,6 +86,15 @@ _T2I_TEMPLATE = (
     "<|im_start|>user\n{}<|im_end|>\n"
     "<|im_start|>assistant\n"
 )
+# Image-conditioned (edit) template; the placeholder repeats once per condition image.
+_IMAGE_PLACEHOLDER = "<image1><|vision_start|><|image_pad|><|vision_end|>"
+_TI2I_TEMPLATE = (
+    f"<|im_start|>system\n{_SYSTEM_PROMPT}<|im_end|>\n"
+    f"<|im_start|>user\n{_IMAGE_PLACEHOLDER}{{}}<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+# Reference images per edit the model was trained with.
+_MAX_CONDITION_IMAGES = 10
 
 _TRANSFORMER_CONFIG_KEYS = (
     "patch_size",
@@ -89,6 +111,9 @@ _TRANSFORMER_CONFIG_KEYS = (
     # Not a diffusers config field; may be set in the stage config's model_config.
     "sequence_parallel",
 )
+
+# Compiled variants allowed per function (see NeuronQwenImage21Pipeline.compile).
+_RECOMPILE_LIMIT = 64
 
 _COMPILER_ARGS = ["--model-type=transformer", "--auto-cast=none", "-O1"]
 _VAE_COMPILER_ARGS = [
@@ -113,6 +138,13 @@ def calculate_shift(image_seq_len, base_seq_len, max_seq_len, base_shift, max_sh
     return image_seq_len * m + base_shift - m * base_seq_len
 
 
+def calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
+    """``(width, height)`` of ``target_area`` pixels at ``ratio``, multiples of 32."""
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+    return round(width / 32) * 32, round(height / 32) * 32
+
+
 def _wait_for(tensor: torch.Tensor) -> None:
     """Block until ``tensor`` is computed.
 
@@ -134,7 +166,11 @@ def _model_path(model: str) -> str:
 
 
 class NeuronQwenImage21Pipeline(nn.Module):
-    """Qwen-Image 2.1 text-to-image on Neuron (TP, optional CP; no CFG)."""
+    """Qwen-Image 2.1 text-to-image and single-image edit on Neuron (TP, optional CP; no CFG)."""
+
+    # Requests may carry a condition image (multi_modal_data["image"]) to edit.
+    support_image_input = True
+    color_format = "RGBA"
 
     # Weights are loaded by load_weights() from the checkpoint directories.
     weights_sources: list = []
@@ -148,6 +184,9 @@ class NeuronQwenImage21Pipeline(nn.Module):
 
         model_config = dict(od_config.model_config or {})
         self.max_text_tokens = int(model_config.pop("max_text_tokens", _DEFAULT_MAX_TEXT_TOKENS))
+        # Area (as a side length) the edit condition image, and by default the edited
+        # output, are resized to: the reference's ``output_resolution``.
+        self.edit_resolution = int(model_config.pop("edit_resolution", _DEFAULT_RESOLUTION))
 
         self.processor = AutoProcessor.from_pretrained(self.model_path, subfolder="processor")
         sys_message = [{"role": "system", "content": [{"type": "text", "text": _SYSTEM_PROMPT}]}]
@@ -161,6 +200,20 @@ class NeuronQwenImage21Pipeline(nn.Module):
 
         self.text_encoder = NeuronQwen3VLTextEncoder(
             self.model_path, seq_len=self.encoder_seq_len, dtype=dtype
+        )
+        # Edit (image-conditioned) requests: the Qwen3-VL vision tower, and the static
+        # ``get_rope_index`` of the transformers model for the image's MRoPE positions.
+        self.vision_encoder = NeuronQwen3VLVisionEncoder(self.model_path, dtype=dtype)
+        vl_config = AutoConfig.from_pretrained(self.model_path, subfolder="text_encoder")
+        self.image_token_id = vl_config.image_token_id
+        self._rope_index_owner = SimpleNamespace(
+            config=vl_config,
+            get_vision_position_ids=lambda *a, **k: Qwen3VLModel.get_vision_position_ids(
+                None, *a, **k
+            ),
+        )
+        self.image_processor = VaeImageProcessor(
+            vae_scale_factor=_VAE_SCALE_FACTOR, vae_latent_channels=64
         )
 
         tf_config = load_transformer_config(self.model_path, "transformer", True)
@@ -188,16 +241,25 @@ class NeuronQwenImage21Pipeline(nn.Module):
         self.last_stage_seconds: dict[str, float] = {}
 
     def to(self, *args, **kwargs):
-        for module in (self.text_encoder, self.transformer, self.vae):
+        for module in (self.text_encoder, self.vision_encoder, self.transformer, self.vae):
             module.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
         self.text_encoder.load_weights(os.path.join(self.model_path, "text_encoder"))
+        self.vision_encoder.load_weights(os.path.join(self.model_path, "text_encoder"))
         self.transformer.load_weights(os.path.join(self.model_path, "transformer"))
         return None
 
     def compile(self, *args, **kwargs):
+        # Every new output size (and, for edits, condition-image size) adds a graph per
+        # stage, and the VAE's up blocks share one forward: lift Dynamo's default limit
+        # of 8 compiled variants per function.
+        dynamo_config = torch._dynamo.config
+        dynamo_config.recompile_limit = max(dynamo_config.recompile_limit, _RECOMPILE_LIMIT)
+        dynamo_config.accumulated_recompile_limit = max(
+            dynamo_config.accumulated_recompile_limit, 8 * _RECOMPILE_LIMIT
+        )
         options = dict(kwargs.pop("options", None) or {})
         kwargs.setdefault("fullgraph", True)
         kwargs.setdefault("dynamic", False)
@@ -206,6 +268,7 @@ class NeuronQwenImage21Pipeline(nn.Module):
             return {**options, "model_name": name, "compiler_args": list(compiler_args)}
 
         self.text_encoder.compile(*args, options=_opts("qwen_image21_text_encoder"), **kwargs)
+        self.vision_encoder.compile(*args, options=_opts("qwen_image21_vision"), **kwargs)
         self.transformer.compile(
             *args,
             prefix_options=_opts("qwen_image21_dit_prefix"),
@@ -258,6 +321,139 @@ class NeuronQwenImage21Pipeline(nn.Module):
         latents = torch.randn(shape, generator=generator, dtype=dtype)
         return latents.view(1, self.latent_channels, height * width).transpose(1, 2).contiguous()
 
+    @staticmethod
+    def _condition_images(prompt) -> list:
+        """The request's condition images (empty for text-to-image)."""
+        if isinstance(prompt, str):
+            return []
+        images = (prompt.get("multi_modal_data") or {}).get("image")
+        if images is None:
+            return []
+        images = list(images) if isinstance(images, (list, tuple)) else [images]
+        if len(images) > _MAX_CONDITION_IMAGES:
+            raise ValueError(f"at most {_MAX_CONDITION_IMAGES} condition images are supported")
+        out = []
+        for image in images:
+            if isinstance(image, str):
+                image = PILImage.open(image)
+            elif not isinstance(image, PILImage.Image):
+                image = PILImage.fromarray(np.asarray(image))
+            out.append(image)
+        return out
+
+    def _prefix_t2i(self, prompt: str, latent_hw, device):
+        """Text-to-image prefix: text K/V, target RoPE and the key count."""
+        latent_h, latent_w = latent_hw
+        input_ids, text_len = self._tokenize(prompt)
+        text_hidden = self.text_encoder(input_ids, device).last_hidden_state
+        txt_cos, txt_sin, img_cos, img_sin = qwen_image21_rope(
+            text_len,
+            self.max_text_tokens,
+            latent_h,
+            latent_w,
+            axes_dim=self.transformer.config.axes_dims_rope,
+        )
+        text_k, text_v = self.transformer.prefix(
+            text_hidden, txt_cos.to(device), txt_sin.to(device)
+        )
+        return text_k, text_v, img_cos, img_sin, text_len
+
+    def _prefix_edit(self, prompt: str, images, latent_hw, device):
+        """Edit prefix: text and condition-image K/V, target RoPE and the key count.
+
+        Mirrors ``QwenImage21Pipeline``: each condition image is resized to the area of
+        ``edit_resolution``² at its own aspect ratio, read by the vision-language encoder
+        (alpha composited over white) through its ``<imageN>`` placeholder of the TI2I
+        template, and VAE-encoded (all four channels) into the latent block that replaces
+        its slots in the DiT prefix.
+        """
+        rgba_images, sizes, vlm_images = [], [], []
+        for image in images:
+            rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+            cond_w, cond_h = calculate_dimensions(
+                self.edit_resolution**2, rgba.size[0] / rgba.size[1]
+            )
+            resized = self.image_processor.resize(rgba, height=cond_h, width=cond_w)
+            white = PILImage.new("RGB", resized.size, (255, 255, 255))
+            white.paste(resized, mask=resized.getchannel("A"))
+            rgba_images.append(rgba)
+            sizes.append((cond_h, cond_w))
+            vlm_images.append(white)
+        placeholders = " ".join(
+            f"<image{i + 1}><|vision_start|><|image_pad|><|vision_end|>" for i in range(len(images))
+        )
+        text = _TI2I_TEMPLATE.replace(_IMAGE_PLACEHOLDER, placeholders).format(prompt or " ")
+        inputs = self.processor(text=[text], images=vlm_images, return_tensors="pt")
+        input_ids, grid_thw = inputs.input_ids, inputs.image_grid_thw
+        num_tokens = input_ids.shape[1]
+        slots = int(grid_thw.prod(-1).sum()) // 4
+        # Even token counts for the NKI MLP kernel; a multiple of 16 for good measure.
+        enc_len = -(-(self.drop_idx + slots + self.max_text_tokens) // 16) * 16
+        if num_tokens > enc_len:
+            raise ValueError(
+                f"prompt is {num_tokens - self.drop_idx - slots} tokens; the compiled text "
+                f"length is {self.max_text_tokens} (raise model_config.max_text_tokens)"
+            )
+
+        # Vision tower (per image: its attention never crosses images), then the
+        # language model with the image tokens and DeepStack features at the placeholder
+        # positions (assembled on the host).
+        image_tokens, deepstack = [], []
+        patches = grid_thw.prod(-1).tolist()
+        for grid, pixels in zip(grid_thw, inputs.pixel_values.split(patches)):
+            tokens, deep = self.vision_encoder(pixels, grid[None], device)
+            image_tokens.append(tokens.cpu())
+            deepstack.append(deep.cpu())
+        image_tokens, deepstack = torch.cat(image_tokens), torch.cat(deepstack, dim=1)
+        padded = torch.full((1, enc_len), self.pad_token_id, dtype=input_ids.dtype)
+        padded[:, :num_tokens] = input_ids
+        is_image = padded[0] == self.image_token_id
+        embeds = self.text_encoder.embed(padded)
+        embeds[0, is_image] = image_tokens.to(embeds.dtype)
+        deepstack_dense = embeds.new_zeros((deepstack.shape[0], 1, enc_len, embeds.shape[-1]))
+        deepstack_dense[:, 0, is_image] = deepstack.to(embeds.dtype)
+        position_ids = self._mrope_positions(input_ids, grid_thw, enc_len)
+        cos, sin = self.text_encoder.mrope_cos_sin(position_ids)
+        hidden = self.text_encoder.forward_multimodal(
+            embeds.to(device), cos.to(device), sin.to(device), deepstack_dense.to(device)
+        ).last_hidden_state
+
+        cond, cond_hw = [], []
+        for rgba, (cond_h, cond_w) in zip(rgba_images, sizes):
+            vae_input = self.image_processor.preprocess(rgba, height=cond_h, width=cond_w)
+            latents = self.vae.encode_image(vae_input.unsqueeze(2).to(device)).cpu()
+            cond_hw.append((latents.shape[-2], latents.shape[-1]))
+            cond.append(latents.view(1, self.latent_channels, -1).transpose(1, 2))
+        cond = torch.cat(cond, dim=1).contiguous()
+
+        layout = qwen_image21_edit_layout(
+            input_ids[0, self.drop_idx :] == self.image_token_id,
+            enc_len - self.drop_idx,
+            cond_hw,
+            latent_hw,
+            axes_dim=self.transformer.config.axes_dims_rope,
+        )
+        text_k, text_v = self.transformer.prefix_edit(
+            hidden,
+            cond.to(device),
+            layout.gather_index.to(device),
+            layout.bound_max.to(device),
+            layout.prefix_cos.to(device),
+            layout.prefix_sin.to(device),
+        )
+        return text_k, text_v, layout.target_cos, layout.target_sin, layout.valid_len
+
+    def _mrope_positions(self, input_ids, grid_thw, length: int) -> torch.Tensor:
+        """Qwen3-VL ``(t, h, w)`` positions ``[3, length]`` (padding continues the text)."""
+        mm_token_type_ids = (input_ids == self.image_token_id).to(torch.int32)
+        positions, _ = Qwen3VLModel.get_rope_index(
+            self._rope_index_owner, input_ids, mm_token_type_ids, image_grid_thw=grid_thw
+        )
+        positions = positions[:, 0]
+        pad = length - positions.shape[1]
+        tail = positions.max() + 1 + torch.arange(pad)
+        return torch.cat([positions, tail.expand(3, pad)], dim=1)
+
     def forward(self, req) -> DiffusionOutput:
         if req.request_ids == ["dummy_req_id"] and self._prompt_of(req.prompts[0]) == "dummy run":
             logger.info("Skipping warmup request on Neuron pipeline")
@@ -272,8 +468,19 @@ class NeuronQwenImage21Pipeline(nn.Module):
         if (sp.num_outputs_per_prompt or 1) > 1:
             raise NotImplementedError("num_outputs_per_prompt > 1 is not supported")
 
-        height = (sp.height or _DEFAULT_RESOLUTION) // _MULTIPLE_OF * _MULTIPLE_OF
-        width = (sp.width or _DEFAULT_RESOLUTION) // _MULTIPLE_OF * _MULTIPLE_OF
+        prompt = self._prompt_of(req.prompts[0])
+        images = self._condition_images(req.prompts[0])
+        height, width = sp.height, sp.width
+        if images:
+            image = images[-1]
+            # By default the reference sizes the output to the edit resolution's area at
+            # the last condition image's aspect ratio.
+            cond_w, cond_h = calculate_dimensions(
+                self.edit_resolution**2, image.size[0] / image.size[1]
+            )
+            height, width = height or cond_h, width or cond_w
+        height = (height or _DEFAULT_RESOLUTION) // _MULTIPLE_OF * _MULTIPLE_OF
+        width = (width or _DEFAULT_RESOLUTION) // _MULTIPLE_OF * _MULTIPLE_OF
         latent_h, latent_w = height // _VAE_SCALE_FACTOR, width // _VAE_SCALE_FACTOR
         image_seq_len = latent_h * latent_w
         num_steps = sp.num_inference_steps or _DEFAULT_STEPS
@@ -282,19 +489,11 @@ class NeuronQwenImage21Pipeline(nn.Module):
         timings: dict[str, float] = {}
 
         t0 = time.perf_counter()
-        input_ids, text_len = self._tokenize(self._prompt_of(req.prompts[0]))
-        text_hidden = self.text_encoder(input_ids, device).last_hidden_state
-
-        txt_cos, txt_sin, img_cos, img_sin = qwen_image21_rope(
-            text_len,
-            self.max_text_tokens,
-            latent_h,
-            latent_w,
-            axes_dim=self.transformer.config.axes_dims_rope,
-        )
-        text_k, text_v = self.transformer.prefix(
-            text_hidden, txt_cos.to(device), txt_sin.to(device)
-        )
+        if not images:
+            prefix = self._prefix_t2i(prompt, (latent_h, latent_w), device)
+        else:
+            prefix = self._prefix_edit(prompt, images, (latent_h, latent_w), device)
+        text_k, text_v, img_cos, img_sin, prefix_len = prefix
         _wait_for(text_v)
         timings["text_encode_seconds"] = time.perf_counter() - t0
 
@@ -311,7 +510,7 @@ class NeuronQwenImage21Pipeline(nn.Module):
             for i, t in enumerate(timesteps)
         ]
         img_cos, img_sin = img_cos.to(device), img_sin.to(device)
-        kv_len = torch.tensor([image_seq_len + text_len], dtype=torch.int32).to(device)
+        kv_len = torch.tensor([image_seq_len + prefix_len], dtype=torch.int32).to(device)
         for timestep, dt in step_inputs:
             latents = self.transformer.step(
                 latents, timestep, dt, text_k, text_v, img_cos, img_sin, kv_len
