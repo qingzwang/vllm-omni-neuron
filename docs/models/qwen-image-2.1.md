@@ -39,7 +39,7 @@ Trainium2 (`trn2`).
 | | Image editing (one condition image) | ✅ |
 | | Multi-image reference editing (up to 10 images) | ✅ |
 | | Masks, region marks | ❌ |
-| | Classifier-free guidance | ❌ (the model is sampled without it) |
+| | True classifier-free guidance (`true_cfg_scale` + negative prompt) | ✅ (off by default, as in diffusers) |
 | **Precision** | BF16 | ✅ |
 | **Parallelism** | Tensor parallelism (TP) | ✅ |
 | | Megatron sequence parallelism (SP, within TP) | ✅ (on by default) |
@@ -103,6 +103,14 @@ python examples/qwen_image_2_1/run.py --image astronaut.jpg livingroom.png \
   --prompt "Place the astronaut from image 1 sitting on the orange sofa in the living room from image 2"
 ```
 
+True classifier-free guidance is off by default: the model is meant to be sampled
+without it, and the diffusers pipeline defaults to `true_cfg_scale=1.0`. As there, it is
+enabled by `true_cfg_scale > 1` together with a negative prompt (an empty string counts):
+
+```bash
+python examples/qwen_image_2_1/run.py --true-cfg-scale 4 --negative-prompt "blurry, low quality"
+```
+
 With the `Omni` API, pass the condition image (or a list of images) in the prompt:
 
 ```python
@@ -112,6 +120,9 @@ omni.generate(
     OmniDiffusionSamplingParams(num_inference_steps=40, seed=42),
 )
 ```
+
+and, for guidance, a `"negative_prompt"` in the prompt dict with `true_cfg_scale` in the
+sampling parameters.
 
 The first request compiles the graphs for the requested resolution and parallel layout:
 roughly 4–5 minutes at 1024x1024 and 15–25 minutes at 2048x2048. An edit compiles
@@ -142,6 +153,10 @@ encoding, denoising, VAE decode and post-processing), averaged over the profiled
 | TP=16 | 16 | 16.0 s | 15.0 s (376 ms) | 0.74 s |
 
 At 512x512 with 20 steps, TP=8 generates an image in 0.95 s.
+
+With true CFG (`true_cfg_scale=4` and a negative prompt) every step runs the DiT twice:
+1024x1024 at TP=8 takes 11.20 s end to end (10.57 s denoise, 264 ms per step), about
+twice the unguided latency.
 
 Latency scales close to linearly with the core count, so per-core throughput is similar
 across these layouts; TP=8 is slightly faster than TP=4 × CP=2 on the same 8 cores. For the
@@ -198,6 +213,13 @@ output with **PSNR 34.8 dB, SSIM 0.967**.
 
 *Edit "Put a red wizard hat on the cat and change the background to a starry night sky":
 Neuron TP=8 (left) and the CPU BF16 diffusers reference (right), 416x608, 20 steps, seed 42.*
+
+**Classifier-free guidance.** With `true_cfg_scale=4` and a negative prompt, the guided
+first-step prediction (`neg + 4 * (pos - neg)`) matches the diffusers reference with a
+relative L2 error of 2e-6 (text-to-image) and 4e-6 (edit) on CPU. On Neuron (TP=8, 20
+steps) the outputs match the CPU BF16 diffusers outputs with SSIM 0.936 (text-to-image,
+512x512; PSNR 23.6 dB on a mostly dark image) and PSNR 30.6 dB / SSIM 0.953 (cat edit,
+416x608).
 
 **Multi-image editing.** With two reference images (astronaut, living room), the
 first-step DiT noise prediction matches the diffusers reference with a relative L2 error
@@ -265,7 +287,9 @@ Reference images (left, image 1 on top) and Neuron output (right), TP=8,
   drawn region marks are not implemented.
 - **New sizes compile.** Each output size, and for edits each condition-image size, adds
   compiled graphs on first use.
-- **No classifier-free guidance.** `true_cfg_scale` and negative prompts are ignored.
+- **CFG runs both branches on the same cores.** With guidance on, every step runs the
+  DiT twice (positive and negative prefix); CFG parallelism across replicas is not
+  implemented.
 - **Batch size is one** prompt and one image per request.
 - **Prompt length is static.** Prompts longer than `model_config.max_text_tokens` (default
   512 tokens, not counting the condition image) are rejected; raise it in the stage config

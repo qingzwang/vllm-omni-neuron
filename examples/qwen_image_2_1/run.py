@@ -77,6 +77,14 @@ parser.add_argument(
     help="Side of the square area edit inputs (and default outputs) are resized to "
     "(model_config.edit_resolution, default 1024).",
 )
+parser.add_argument(
+    "--negative-prompt",
+    type=str,
+    default=None,
+    help="Negative prompt; with --true-cfg-scale > 1 enables true classifier-free "
+    "guidance (off by default: the model is meant to be sampled without it).",
+)
+parser.add_argument("--true-cfg-scale", type=float, default=None)
 parser.add_argument("--output", type=str, default="qwen_image_2_1.png")
 parser.add_argument(
     "--profile",
@@ -146,6 +154,8 @@ def main():
 
     height, width, steps = (512, 512, 8) if args.dev else (1024, 1024, 40)
     request = {"prompt": args.prompt}
+    if args.negative_prompt is not None:
+        request["negative_prompt"] = args.negative_prompt
     if args.image:
         from PIL import Image
 
@@ -158,6 +168,7 @@ def main():
         width=args.width or width,
         num_inference_steps=args.steps or steps,
         seed=args.seed,
+        true_cfg_scale=args.true_cfg_scale,
     )
     size = f"{params.height}x{params.width}" if params.height else "edit (image aspect)"
     print(f"Generating: {size}, {params.num_inference_steps} steps")

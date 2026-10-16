@@ -820,6 +820,40 @@ class QwenImage21Transformer2DModel(nn.Module):
         Returns:
             The updated latents, in ``latents.dtype``.
         """
+        noise_pred = self._predict(latents, timestep, text_k, text_v, cos, sin, kv_len)
+        return _euler_step(latents, dt, noise_pred)
+
+    def forward_step_cfg(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        dt: torch.Tensor,
+        text_k: torch.Tensor,
+        text_v: torch.Tensor,
+        neg_text_k: torch.Tensor,
+        neg_text_v: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        neg_cos: torch.Tensor,
+        neg_sin: torch.Tensor,
+        kv_len: torch.Tensor,
+        neg_kv_len: torch.Tensor,
+        cfg_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """:meth:`forward_step` with true classifier-free guidance.
+
+        Predicts the flow with the positive and the negative prefix and combines them as
+        the reference does, ``neg + cfg_scale * (pos - neg)`` in the model dtype, before
+        the Euler step. Each branch has its own target RoPE: the image's frame position
+        follows its prefix.
+        """
+        pos = self._predict(latents, timestep, text_k, text_v, cos, sin, kv_len)
+        neg = self._predict(latents, timestep, neg_text_k, neg_text_v, neg_cos, neg_sin, neg_kv_len)
+        noise_pred = neg + ((pos - neg).float() * cfg_scale.float()).to(pos.dtype)
+        return _euler_step(latents, dt, noise_pred)
+
+    def _predict(self, latents, timestep, text_k, text_v, cos, sin, kv_len) -> torch.Tensor:
+        """Flow prediction ``[1, N, C_out]`` for the image tokens (see :meth:`forward_step`)."""
         dtype = self.dtype
         eps = self.config.eps
         seq_len = latents.shape[1]
@@ -880,10 +914,7 @@ class QwenImage21Transformer2DModel(nn.Module):
             noise_pred = noise_pred[:, :seq_len]
         if self.cp_group is not None:
             noise_pred = self.cp_group.all_gather(noise_pred.contiguous(), dim=1)
-        # FlowMatchEulerDiscreteScheduler.step: float32 update, cast back to the
-        # model output dtype.
-        updated = latents.float() + dt.float() * noise_pred.float()
-        return updated.to(noise_pred.dtype)
+        return noise_pred
 
     def compile(self, *args, prefix_options=None, step_options=None, **kwargs):
         self._compiled_prefix = torch.compile(
@@ -897,6 +928,11 @@ class QwenImage21Transformer2DModel(nn.Module):
         self._compiled_step = torch.compile(
             self.forward_step, *args, options=step_options, **kwargs
         )
+        cfg_options = {**(step_options or {})}
+        cfg_options["model_name"] = f"{cfg_options.get('model_name', 'step')}_cfg"
+        self._compiled_step_cfg = torch.compile(
+            self.forward_step_cfg, *args, options=cfg_options, **kwargs
+        )
 
     def prefix_edit(self, *args):
         fn = getattr(self, "_compiled_prefix_edit", None) or self.forward_prefix_edit
@@ -908,6 +944,10 @@ class QwenImage21Transformer2DModel(nn.Module):
 
     def step(self, *args):
         fn = self._compiled_step if self._compiled_step is not None else self.forward_step
+        return fn(*args)
+
+    def step_cfg(self, *args):
+        fn = getattr(self, "_compiled_step_cfg", None) or self.forward_step_cfg
         return fn(*args)
 
     def load_weights(self, model_path: str) -> None:
@@ -949,6 +989,12 @@ class QwenImage21Transformer2DModel(nn.Module):
             tp_rank,
             tp_size,
         )
+
+
+def _euler_step(latents: torch.Tensor, dt: torch.Tensor, noise_pred: torch.Tensor) -> torch.Tensor:
+    """FlowMatchEulerDiscreteScheduler.step: float32 update, cast to the model dtype."""
+    updated = latents.float() + dt.float() * noise_pred.float()
+    return updated.to(noise_pred.dtype)
 
 
 def _cast_loader(loader, dtype: torch.dtype):
