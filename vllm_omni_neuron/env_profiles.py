@@ -98,3 +98,6 @@ class Wan22EnvProfile:
 
 WAN22_T2V = Wan22EnvProfile()
 WAN22_I2V = Wan22EnvProfile()
+# HunyuanImage-3.0 runs on the Wan2.2 settings; its 32-layer MoE graphs take longer to
+# compile than the default timeout.
+HUNYUAN_IMAGE3_T2I = Wan22EnvProfile(VLLM_NEURON_COMPILATION_TIMEOUT="7200")
