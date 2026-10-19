@@ -10,6 +10,8 @@ Usage:
     python examples/qwen_image_2_1/run.py --image in.png --prompt "Make it snow"   # edit
     python examples/qwen_image_2_1/run.py --image a.png b.png \
         --prompt "Put the person from image 1 into the scene of image 2"         # multi-image
+    python examples/qwen_image_2_1/run.py --image in.png --mask-box 100 80 400 360 \
+        --prompt "Replace the object circled in red with a vase of flowers"     # region mark
 """
 
 import argparse
@@ -85,6 +87,35 @@ parser.add_argument(
     "guidance (off by default: the model is meant to be sampled without it).",
 )
 parser.add_argument("--true-cfg-scale", type=float, default=None)
+parser.add_argument(
+    "--mask",
+    type=str,
+    nargs="+",
+    default=None,
+    help="Mask image(s) of regions to edit on the last --image (white, or transparent "
+    "for images with alpha, marks a region); see --mask-mode.",
+)
+parser.add_argument(
+    "--mask-box",
+    type=float,
+    nargs=4,
+    action="append",
+    metavar=("X0", "Y0", "X1", "Y1"),
+    help="A box region on the last --image, in its pixels (repeatable; after --mask).",
+)
+parser.add_argument(
+    "--mask-mode",
+    choices=("outline", "image"),
+    default=None,
+    help="outline (default): draw each region's outline on the image in its color "
+    "(red, green, blue, ...); image: pass the regions as an extra mask image after the inputs.",
+)
+parser.add_argument("--mask-colors", type=str, nargs="+", default=None)
+parser.add_argument(
+    "--mask-composite",
+    action="store_true",
+    help="Keep the original pixels outside the regions in the output.",
+)
 parser.add_argument("--output", type=str, default="qwen_image_2_1.png")
 parser.add_argument(
     "--profile",
@@ -161,9 +192,18 @@ def main():
 
         images = [Image.open(path) for path in args.image]
         request["multi_modal_data"] = {"image": images if len(images) > 1 else images[0]}
+        regions = [Image.open(path) for path in args.mask or []] + list(args.mask_box or [])
+        if regions:
+            request["multi_modal_data"]["mask_image"] = regions
         # The pipeline derives the output size from the condition image.
         height = width = None
+    mask_options = {
+        "mask_mode": args.mask_mode,
+        "mask_colors": args.mask_colors,
+        "mask_composite": args.mask_composite or None,
+    }
     params = OmniDiffusionSamplingParams(
+        extra_args={k: v for k, v in mask_options.items() if v is not None},
         height=args.height or height,
         width=args.width or width,
         num_inference_steps=args.steps or steps,

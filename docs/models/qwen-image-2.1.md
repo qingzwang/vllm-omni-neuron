@@ -8,7 +8,7 @@ reference, sample outputs, and known limitations. -->
 diffusion, DiT, Qwen3-VL, vLLM, vLLM Omni, Neuron, Trainium, trn2, BF16, tensor parallelism,
 context parallelism, sequence parallelism -->
 <!-- meta: content_type: model-card -->
-<!-- meta: date_updated: 2026-10-15 -->
+<!-- meta: date_updated: 2026-10-19 -->
 
 ## Introduction
 
@@ -19,8 +19,8 @@ that produces RGBA images. The DiT attends over one joint text/image sequence wi
 block-causal mask, and modulates the text tokens from `t = 0`, which makes their keys and
 values independent of the denoising step.
 
-Qwen-Image-2.1 **text-to-image** and **image editing** (up to 10 reference images) are
-supported with
+Qwen-Image-2.1 **text-to-image** and **image editing** (up to 10 reference images, with
+masks and region marks for local edits) are supported with
 [vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) using the Neuron SDK on AWS
 Trainium2 (`trn2`).
 
@@ -38,7 +38,7 @@ Trainium2 (`trn2`).
 | | 512x512 to 2048x2048 (multiples of 32) | ✅ |
 | | Image editing (one condition image) | ✅ |
 | | Multi-image reference editing (up to 10 images) | ✅ |
-| | Masks, region marks | ❌ |
+| | Masks, region marks (drawn outlines or a separate mask image) | ✅ |
 | | True classifier-free guidance (`true_cfg_scale` + negative prompt) | ✅ (off by default, as in diffusers) |
 | **Precision** | BF16 | ✅ |
 | **Parallelism** | Tensor parallelism (TP) | ✅ |
@@ -77,6 +77,27 @@ first two steps, as in the reference pipeline:
   a latent block that takes the place of its image slots in the DiT prefix. The prefix
   attention is causal over text and bidirectional inside each image block.
 
+**Masks and region marks.** Qwen-Image-2.1 has no mask input: it was trained to read local
+edits from the images themselves, as colored marks drawn around a region (referred to by
+color in the prompt, and removed in the output) or as a separate mask image. Images that
+already carry hand-drawn marks need nothing extra. Otherwise pass the regions in
+`multi_modal_data["mask_image"]` (the key vLLM Omni's `/v1/images/edits` endpoint fills),
+and the pipeline renders them on the host for the last condition image:
+
+- A region is a mask image (white marks the region; for an image with an alpha channel,
+  the transparent area does, as in the OpenAI images API) or a box `(x0, y0, x1, y1)` in
+  the image's pixels. Several regions get the colors red, green, blue, ... in order
+  (`mask_colors` overrides them).
+- `mask_mode="outline"` (default) draws each region's outline in its color just outside
+  the region, as in the model card's circle-guided editing examples.
+- `mask_mode="image"` appends one mask image after the inputs (the region in white, or
+  several regions in their colors, on black); the prompt refers to it as the last image.
+- `mask_composite=True` pastes the original pixels back outside the regions (grown and
+  feathered by a few pixels), so the rest of the image is kept exactly.
+
+The options go in `OmniDiffusionSamplingParams.extra_args`. The marks are plain image
+content, so the compiled graphs are the same as for any edit of that size.
+
 The DiT projections use the fused NKI QKV kernel (projection, per-head RMS QK-norm and RoPE
 in one kernel, head-major output) and the fused AdaLN kernel, with sequence parallelism
 over the TP group.
@@ -101,6 +122,15 @@ python examples/qwen_image_2_1/run.py --image cat.png \
 # Multi-image reference editing: the output size follows the last image
 python examples/qwen_image_2_1/run.py --image astronaut.jpg livingroom.png \
   --prompt "Place the astronaut from image 1 sitting on the orange sofa in the living room from image 2"
+
+# Local edit of a region: box (or --mask mask.png), drawn as a red outline
+python examples/qwen_image_2_1/run.py --image livingroom.png \
+  --mask-box 240 168 372 310 --mask-box 470 210 640 470 \
+  --prompt "Replace the mirror outlined in red with a round wall clock, and replace the plant outlined in green with a tall brass floor lamp"
+
+# A region as a separate mask image (image 2), keeping everything outside it unchanged
+python examples/qwen_image_2_1/run.py --image cat.png --mask mask.png --mask-mode image --mask-composite \
+  --prompt "Add a small framed painting of a sailboat to image 1, in the area shown in white in image 2"
 ```
 
 True classifier-free guidance is off by default: the model is meant to be sampled
@@ -122,7 +152,17 @@ omni.generate(
 ```
 
 and, for guidance, a `"negative_prompt"` in the prompt dict with `true_cfg_scale` in the
-sampling parameters.
+sampling parameters. For a local edit add the regions and, optionally, the mask options:
+
+```python
+omni.generate(
+    {
+        "prompt": "Replace the object outlined in red with a vase of flowers",
+        "multi_modal_data": {"image": image, "mask_image": [(100, 80, 400, 360)]},
+    },
+    OmniDiffusionSamplingParams(num_inference_steps=40, seed=42, extra_args={"mask_composite": True}),
+)
+```
 
 The first request compiles the graphs for the requested resolution and parallel layout:
 roughly 4–5 minutes at 1024x1024 and 15–25 minutes at 2048x2048. An edit compiles
@@ -173,6 +213,11 @@ condition image; "prefix" is the vision tower, language model, VAE encoder and D
 | 640x640 (living room) | 1024x1024 | 7.51 s | 6.25 s (156 ms) | 0.76 s |
 | 2 images (astronaut, living room) | 1024x1024 | 8.83 s | 6.98 s (175 ms) | 1.34 s |
 | 3 images (cat, astronaut, living room) | 1024x1024 | 10.39 s | 7.77 s (194 ms) | 2.11 s |
+
+Local edits run at the cost of a plain edit of the same size: the outline mode changes
+only the input pixels (the living-room two-region edit below takes 7.65 s at 1024x1024,
+the cat box edit 7.84 s at 1248x864), compositing adds about 0.3 s at 1248x864, and the
+mask-image mode adds one more reference image (9.31 s for the cat).
 
 Editing costs more per step than text-to-image at the same size because the target
 attends to the condition images' latent tokens as well as the text; each extra reference
@@ -232,6 +277,18 @@ CPU BF16 diffusers output with **PSNR 28.2 dB, SSIM 0.934**.
 image 2": Neuron TP=8 (left) and the CPU BF16 diffusers reference (right), 512x512, 20
 steps, seed 42.*
 
+**Masks and region marks.** The outlines are rendered on the host before the reference
+path, so the diffusers pipeline given the same marked image is the reference. For the
+two-region living-room edit below (two boxes as red and green outlines), the Neuron output
+(TP=8, `edit_resolution=512`, 20 steps) matches the CPU BF16 diffusers output with
+**PSNR 40.1 dB, SSIM 0.993**.
+
+![Region-mark edit: Neuron (left) vs CPU diffusers reference (right)](images/qwen-image-2.1/mask_neuron_vs_cpu_reference_512.jpg)
+
+*"Replace the mirror outlined in red with a round wall clock, and replace the plant outlined
+in green with a tall brass floor lamp": Neuron TP=8 (left) and the CPU BF16 diffusers
+reference (right), 512x512, 20 steps, seed 42.*
+
 ## Sample outputs
 
 Generated on Neuron (TP=8, 1024x1024, 40 steps, seed 42), downscaled for this page.
@@ -281,10 +338,38 @@ Reference images (left, image 1 on top) and Neuron output (right), TP=8,
 
 *The cat from image 1 and the astronaut from image 2 sitting together on the orange sofa in the living room from image 3*
 
+### Masks and region marks
+
+TP=8, `edit_resolution=1024`, 40 steps, seed 42. The image the model sees (with the marks
+drawn by the pipeline) is on the left.
+
+![region marks living room](images/qwen-image-2.1/mask_room_two_regions.jpg)
+
+*Two boxes (`--mask-box`), drawn in red and green: "Replace the mirror outlined in red with
+a round wall clock, and replace the plant outlined in green with a tall brass floor lamp"*
+
+![region mark cat](images/qwen-image-2.1/mask_cat_box_outline.jpg)
+
+*Box drawn in red, then the output without and with `mask_composite`: "Add a small framed
+painting of a sailboat on the wall inside the red outline"*
+
+![mask image cat](images/qwen-image-2.1/mask_cat_mask_image.jpg)
+
+*`mask_mode="image"`: the input, the mask image passed as image 2, and the output: "Add a
+small framed painting of a sailboat to image 1, in the area shown in white in image 2"*
+
+Hand-drawn marks work as they are: the model card's
+[circle-guided example](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/image2.1/images/example-18.png)
+(watch circled in blue, hair in red, clothing in green), edited on Neuron with "Remove the
+watch circled in blue, change the blond hair circled in red to short black hair, and change
+the white clothing circled in green to a gray long-sleeve shirt", gives the three changes
+with the marks removed (992x1056, 7.42 s warm).
+
 ## Known limitations
 
-- **No masks or region marks.** Edits take up to 10 whole reference images; masks and
-  drawn region marks are not implemented.
+- **Masks are guidance, not hard constraints.** As in the reference, the model reads the
+  marks or the mask image as part of the prompt; content outside the regions may still
+  change slightly unless `mask_composite` is on. Regions apply to the last condition image.
 - **New sizes compile.** Each output size, and for edits each condition-image size, adds
   compiled graphs on first use.
 - **CFG runs both branches on the same cores.** With guidance on, every step runs the

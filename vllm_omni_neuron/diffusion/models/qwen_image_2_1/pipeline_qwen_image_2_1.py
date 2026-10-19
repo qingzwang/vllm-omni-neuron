@@ -21,6 +21,10 @@ An edit request (one condition image in ``multi_modal_data["image"]``) differs i
 and DeepStack features, MRoPE positions), the VAE encoder turns it into a latent block,
 and the prefix graph runs text plus that block with a block-causal mask.
 
+Local edits use masks the way the model was trained for them, as image content (see
+``region_marks``): ``multi_modal_data["mask_image"]`` regions are drawn as colored
+outlines on the image to edit, or passed as an extra mask image.
+
 Timesteps, sigmas, RoPE tables and the initial noise are computed on the host exactly
 as the reference does, so a seed gives the reference's starting point.
 """
@@ -59,6 +63,7 @@ from vllm_omni_neuron.diffusion.models.qwen_image_2_1.qwen_image_2_1_transformer
     qwen_image21_edit_layout,
     qwen_image21_rope,
 )
+from vllm_omni_neuron.diffusion.models.qwen_image_2_1.region_marks import apply_masks, composite
 from vllm_omni_neuron.lite_compat import is_lite_runtime
 
 logger = logging.getLogger(__name__)
@@ -331,8 +336,6 @@ class NeuronQwenImage21Pipeline(nn.Module):
         if images is None:
             return []
         images = list(images) if isinstance(images, (list, tuple)) else [images]
-        if len(images) > _MAX_CONDITION_IMAGES:
-            raise ValueError(f"at most {_MAX_CONDITION_IMAGES} condition images are supported")
         out = []
         for image in images:
             if isinstance(image, str):
@@ -497,9 +500,18 @@ class NeuronQwenImage21Pipeline(nn.Module):
 
         prompt = self._prompt_of(req.prompts[0])
         images = self._condition_images(req.prompts[0])
+        regions = None
+        if isinstance(req.prompts[0], dict):
+            regions = (req.prompts[0].get("multi_modal_data") or {}).get("mask_image")
+        mask_union = None
+        target = images[-1] if images else None
+        if regions is not None:
+            images, mask_union = apply_masks(images, regions, sp.extra_args or {})
+        if len(images) > _MAX_CONDITION_IMAGES:
+            raise ValueError(f"at most {_MAX_CONDITION_IMAGES} condition images are supported")
         height, width = sp.height, sp.width
         if images:
-            image = images[-1]
+            image = target
             # By default the reference sizes the output to the edit resolution's area at
             # the last condition image's aspect ratio.
             cond_w, cond_h = calculate_dimensions(
@@ -586,6 +598,11 @@ class NeuronQwenImage21Pipeline(nn.Module):
             image = self.vae.decode_image(z.to(device))
         if self.is_output_rank:
             output = image[:, :, 0].cpu().float()
+            if mask_union is not None:
+                original = self.image_processor.preprocess(
+                    target.convert("RGBA"), height=height, width=width
+                )
+                output = composite(output, original.float(), mask_union)
             timings["vae_decode_seconds"] = time.perf_counter() - t0
             timings["num_steps"] = len(step_inputs)
             self.last_stage_seconds = timings
