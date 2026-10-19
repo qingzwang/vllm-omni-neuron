@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HunyuanImage-3.0 text-to-image on Neuron via the Omni entrypoint.
+"""HunyuanImage-3.0 text-to-image and image editing on Neuron via the Omni entrypoint.
 
 Usage:
     python examples/hunyuan_image3/run.py                          # 1024x1024, 50 steps, TP=16
@@ -7,6 +7,8 @@ Usage:
     python examples/hunyuan_image3/run.py --tensor-parallel-size 32
     python examples/hunyuan_image3/run.py --cfg-parallel-size 2       # TP=16 x CFG=2
     python examples/hunyuan_image3/run.py --profile                # warm runs after the first
+    python examples/hunyuan_image3/run.py --image in.png --prompt "Make it snow"   # edit
+        # (editing uses tencent/HunyuanImage-3.0-Instruct, TP=16 x CFG=2)
 """
 
 import argparse
@@ -29,12 +31,31 @@ from vllm_omni_neuron import env_profiles
 torch.nn.functional.gelu = torch.ops.aten.gelu.default
 
 parser = argparse.ArgumentParser(description="HunyuanImage-3.0 text-to-image on Neuron")
-parser.add_argument("--height", type=int, default=1024)
-parser.add_argument("--width", type=int, default=1024)
-parser.add_argument("--steps", type=int, default=50)
-parser.add_argument("--guidance-scale", type=float, default=5.0)
+parser.add_argument("--height", type=int, default=None)
+parser.add_argument("--width", type=int, default=None)
+parser.add_argument("--steps", type=int, default=None, help="Default: the checkpoint's (50).")
+parser.add_argument(
+    "--guidance-scale",
+    type=float,
+    default=None,
+    help="Default: the checkpoint's (5.0 base, 2.5 Instruct).",
+)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--model-path", type=str, default="tencent/HunyuanImage-3.0")
+parser.add_argument(
+    "--image",
+    type=str,
+    nargs="+",
+    default=None,
+    help="Condition image(s) to edit with --prompt as the instruction (refer to them as "
+    "image 1, image 2, ...). Uses the Instruct checkpoint; the output takes the first "
+    "image's resolution bucket unless --height/--width are given.",
+)
+parser.add_argument(
+    "--model-path",
+    type=str,
+    default=None,
+    help="Default: tencent/HunyuanImage-3.0, or tencent/HunyuanImage-3.0-Instruct with --image.",
+)
 parser.add_argument(
     "--tensor-parallel-size",
     type=int,
@@ -67,11 +88,14 @@ parser.add_argument(
 )
 parser.add_argument("--profile-runs", type=int, default=3)
 args = parser.parse_args()
+if args.model_path is None:
+    args.model_path = "tencent/HunyuanImage-3.0" + ("-Instruct" if args.image else "")
 
 
 def _stage_config() -> str:
+    default = "hunyuan_image3_instruct_stage.yaml" if "Instruct" in args.model_path else None
     path = args.stage_config or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "hunyuan_image3_stage.yaml"
+        os.path.dirname(os.path.abspath(__file__)), default or "hunyuan_image3_stage.yaml"
     )
     if args.tensor_parallel_size is None and args.cfg_parallel_size is None:
         return path
@@ -119,28 +143,34 @@ def main():
         init_timeout=cold_timeout,
     )
     params = OmniDiffusionSamplingParams(
-        height=args.height,
-        width=args.width,
+        height=args.height or (None if args.image else 1024),
+        width=args.width or (None if args.image else 1024),
         num_inference_steps=args.steps,
-        guidance_scale=args.guidance_scale,
+        guidance_scale=args.guidance_scale or 0.0,  # 0: the checkpoint's default
         seed=args.seed,
     )
-    size = f"{args.height}x{args.width}"
-    print(f"Generating: {size}, {args.steps} steps, guidance {args.guidance_scale}")
+    request = {"prompt": args.prompt}
+    if args.image:
+        from PIL import Image
+
+        images = [Image.open(path) for path in args.image]
+        request["multi_modal_data"] = {"image": images if len(images) > 1 else images[0]}
+    size = f"{params.height}x{params.width}" if params.height else "edit (first image's bucket)"
+    print(f"Generating: {size}, model {args.model_path}")
     t0 = time.perf_counter()
-    result = omni.generate({"prompt": args.prompt}, params)
+    result = omni.generate(request, params)
     print(f"[run] first request (includes compilation): {time.perf_counter() - t0:.2f}s")
 
     if args.profile:
         times = []
         for i in range(args.profile_runs):
             t0 = time.perf_counter()
-            result = omni.generate({"prompt": args.prompt}, params)
+            result = omni.generate(request, params)
             times.append(time.perf_counter() - t0)
             print(f"[profile] run {i + 1}/{args.profile_runs}: {times[-1]:.3f}s")
         print("=" * 60)
         print(
-            f"[profile] {size}, {args.steps} steps, TP={_tp} CFG={_cfg}: mean {statistics.mean(times):.3f}s, "
+            f"[profile] {size}, TP={_tp} CFG={_cfg}: mean {statistics.mean(times):.3f}s, "
             f"min {min(times):.3f}s, max {max(times):.3f}s over {len(times)} runs"
         )
         print("=" * 60)

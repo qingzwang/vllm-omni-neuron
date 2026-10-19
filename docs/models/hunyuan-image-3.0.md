@@ -1,9 +1,11 @@
 # HunyuanImage-3.0 Model Card
 
-<!-- meta: description: Model card for HunyuanImage-3.0 text-to-image on AWS Trainium with
-the vLLM Omni Neuron plugin — supported features, parallelism configurations, latency at
-1024x1024, accuracy against the official reference, sample outputs, and known limitations. -->
-<!-- meta: keywords: HunyuanImage-3.0, Hunyuan, model card, text-to-image, image generation,
+<!-- meta: description: Model card for HunyuanImage-3.0 text-to-image and
+HunyuanImage-3.0-Instruct image editing on AWS Trainium with the vLLM Omni Neuron plugin —
+supported features, parallelism configurations, latency, accuracy against the official
+reference, sample outputs, and known limitations. -->
+<!-- meta: keywords: HunyuanImage-3.0, HunyuanImage-3.0-Instruct, Hunyuan, model card,
+text-to-image, image editing, multi-image fusion, image generation,
 diffusion, mixture of experts, MoE, vLLM, vLLM Omni, Neuron, Trainium, trn2, BF16, tensor
 parallelism, expert parallelism, CFG parallelism, sequence parallelism -->
 <!-- meta: content_type: model-card -->
@@ -20,7 +22,8 @@ denoising step runs the language model over them. Small convolutional heads embe
 latent channels into the model and project its output back to a velocity, and a 3-D
 convolutional VAE (16x spatial) decodes the result.
 
-HunyuanImage-3.0 **text-to-image** is supported with
+HunyuanImage-3.0 **text-to-image** and HunyuanImage-3.0-Instruct **image editing** (one or
+more reference images) are supported with
 [vLLM Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/) using the Neuron SDK on AWS
 Trainium2 (`trn2`); the plugin replaces vLLM Omni's `HunyuanImage3Pipeline`
 (`HunyuanImage3ForCausalMM`).
@@ -30,8 +33,9 @@ Trainium2 (`trn2`); the plugin replaces vLLM Omni's `HunyuanImage3Pipeline`
 | Model | HuggingFace | Hardware | Precision |
 |-------|-------------|----------|-----------|
 | HunyuanImage-3.0 | [tencent/HunyuanImage-3.0](https://huggingface.co/tencent/HunyuanImage-3.0) | Trn2 | BF16 |
+| HunyuanImage-3.0-Instruct | [tencent/HunyuanImage-3.0-Instruct](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct) | Trn2 | BF16 |
 
-The checkpoint is released under the Tencent Hunyuan Community License; check its terms
+The checkpoints are released under the Tencent Hunyuan Community License; check its terms
 (including its territory restrictions) before use.
 
 ## Features
@@ -40,9 +44,10 @@ The checkpoint is released under the Tencent Hunyuan Community License; check it
 |---|---|---|
 | **Generation** | Text-to-image | ✅ |
 | | The 33 resolution buckets around 1024x1024 (512x2048 to 2048x512) | ✅ |
-| | Classifier-free guidance (`guidance_scale`, default 5.0, as the checkpoint) | ✅ |
+| | Classifier-free guidance (`guidance_scale`, default 5.0 / 2.5 for Instruct, as the checkpoints) | ✅ |
+| | Image editing (Instruct; condition images in `multi_modal_data["image"]`) | ✅ |
+| | Multi-image fusion (several condition images) | ✅ |
 | | Automatic aspect ratio (`image_size="auto"`), think / recaption prompting | ❌ |
-| | Image editing (HunyuanImage-3.0-Instruct) | ❌ |
 | **Precision** | BF16 | ✅ |
 | **Parallelism** | Tensor parallelism (TP) of attention heads | ✅ |
 | | Expert parallelism (EP) over the TP ranks | ✅ (always on) |
@@ -76,8 +81,9 @@ graphs:
    layer), applies the guidance and the flow-matching Euler update in-graph. The latents
    stay on device for the whole loop.
 3. **VAE decoder** — the latent-resolution head (with its global attention) on every
-   rank, then each up level as row strips over all ranks with exact halos and
-   all-reduced GroupNorm statistics.
+   rank, then the up levels as row strips over all ranks with exact halos and
+   all-reduced GroupNorm statistics (the last three levels in one graph, so their
+   full-resolution intermediates are never gathered).
 
 Parallel layout (TP=16 on one replica):
 
@@ -99,6 +105,29 @@ The schedule is the checkpoint's own (`sigma = linspace(1, 0, steps + 1)` with s
 50 steps); sizes snap to the nearest of the 33 resolution buckets by aspect ratio, as the
 official image processor does.
 
+**Image editing** (HunyuanImage-3.0-Instruct, direct generation as `bot_task="image"`)
+changes only the prefix. The official Instruct sequence is
+
+```
+<bos> system prompt "User: "
+  per condition image: <boi> <img_size_1024> <img_ratio_k> <timestep>
+                       VAE latent tokens <joint_img_sep> 1024 SigLIP2 tokens <eoi>
+  instruction "Assistant: " <answer> <boi> <img_size_1024> <img_ratio>
+<timestep> <img> x N ...
+```
+
+with the checkpoint's unified system prompt (about 1200 tokens). Each condition image is
+resized and centre-cropped to its resolution bucket and encoded by the **VAE encoder**
+(latents sampled from the posterior, patch-embedded at timestep 0; the encoder's levels run
+as row strips over all ranks, like the decoder), and its original pixels by the **SigLIP2
+tower** and aligner (replicated, 1024 tokens with key padding). The prefix is causal
+except inside each condition image (its VAE and SigLIP2 tokens attend to each other), via
+per-query attention bounds; the unconditional row keeps the images and replaces the
+instruction with `<cfg>`. Nothing in the prefix depends on the timestep, so its K/V are
+computed once per request and the step graph is the text-to-image one. The output takes
+the first condition image's bucket unless a size is given; the prefix is padded to a
+multiple of 1024 tokens.
+
 ## Running
 
 ```bash
@@ -116,6 +145,15 @@ python examples/hunyuan_image3/run.py --tensor-parallel-size 32
 python examples/hunyuan_image3/run.py --profile --profile-runs 3
 ```
 
+# Image editing with the Instruct checkpoint (TP=16 x CFG=2,
+# examples/hunyuan_image3/hunyuan_image3_instruct_stage.yaml); refer to several images as
+# image 1, image 2, ...
+python examples/hunyuan_image3/run.py --image cat.png \
+  --prompt "Put a red wizard hat on the cat and change the background to a starry night sky"
+python examples/hunyuan_image3/run.py --image astronaut.jpg livingroom.png \
+  --prompt "Place the astronaut from image 1 sitting on the orange sofa in the living room from image 2"
+```
+
 With the `Omni` API:
 
 ```python
@@ -126,8 +164,19 @@ omni.generate(
 )
 ```
 
-`guidance_scale` defaults to the checkpoint's 5.0; `guidance_scale <= 1` turns guidance
-off (one row).
+and, for an edit (with `model="tencent/HunyuanImage-3.0-Instruct"`), the condition image
+(or a list of images) in the prompt:
+
+```python
+from PIL import Image
+omni.generate(
+    {"prompt": "Make it snow", "multi_modal_data": {"image": Image.open("in.png")}},
+    OmniDiffusionSamplingParams(num_inference_steps=50, seed=42),
+)
+```
+
+`guidance_scale` and the step count default to the checkpoint's (5.0 / 2.5 and 50);
+`guidance_scale <= 1` turns guidance off (one row).
 
 Loading the 160 GB checkpoint takes about a minute. The first request compiles the
 graphs for the requested size and parallel layout, about 5–8 minutes; later runs load
@@ -142,9 +191,25 @@ profiled runs.
 
 | Configuration | NeuronCores | End-to-end | Denoise (per step) | VAE decode |
 |---|---|---|---|---|
-| TP=16 | 16 | 21.17 s | 20.01 s (400 ms) | 0.97 s |
-| TP=32 | 32 | 15.26 s | 14.37 s (287 ms) | 0.74 s |
-| TP=16 × CFG=2 | 32 | 12.45 s | 11.59 s (232 ms) | 0.74 s |
+| TP=16 | 16 | 20.78 s | 20.00 s (400 ms) | 0.59 s |
+| TP=32 | 32 | 15.06 s | 14.37 s (287 ms) | 0.55 s |
+| TP=16 × CFG=2 | 32 | 12.25 s | 11.57 s (231 ms) | 0.53 s |
+
+**Image editing** (HunyuanImage-3.0-Instruct, TP=16 × CFG=2, 50 steps, guidance 2.5).
+The output takes the first condition image's bucket; "prefix" is the VAE encoder, the
+SigLIP2 tower and the prefix graph (system prompt, condition images and instruction).
+
+| Condition images | Output | End-to-end | Denoise (per step) | Prefix |
+|---|---|---|---|---|
+| 1 (cat, 1024x704) | 832x1216 | 17.33 s | 16.00 s (320 ms) | 0.95 s |
+| 1 (astronaut) | 768x1024 | 10.89 s | 9.86 s (197 ms) | 0.73 s |
+| 1 (living room, 640x640) | 1024x1024 | 14.82 s | 13.37 s (267 ms) | 0.84 s |
+| 2 (astronaut, living room) | 768x1024 | 12.55 s | 10.63 s (213 ms) | 1.58 s |
+| 3 (cat, astronaut, living room) | 832x1216 | 20.52 s | 17.70 s (354 ms) | 2.33 s |
+
+An edit step costs more than a text-to-image step of the same size because the image
+tokens also attend to the cached prefix (about 1200 system-prompt tokens plus about 5000
+per condition image).
 
 TP=16 is the smallest layout that fits the weights (about 13 GB per NeuronCore). On 32
 NeuronCores CFG parallelism is faster than TP=32: each replica runs half the tokens, so
@@ -179,6 +244,12 @@ the composition, text and lighting are the same.
 *Neuron TP=16 (left) and the official implementation on CPU in BF16 (right): 1024x1024,
 20 steps, seed 42.*
 
+**Image editing.** The Instruct path is checked against the official Instruct code on CPU
+in FP32 (first 2 layers): the token sequence and the prefix attention mask match exactly,
+the SigLIP2 tower and aligner with a relative L2 error of 2e-7, the VAE encoder's posterior
+mean with 4e-7 (also over 4 processes), and the first- and second-step velocities of an
+edit (prefix with the condition image, then steps) with 3e-7 at TP=1 and 1e-6 at TP=16.
+
 ## Sample outputs
 
 Generated on Neuron (TP=16 × CFG=2, 50 steps, guidance 5, seed 42), downscaled for this
@@ -198,17 +269,61 @@ page.
 *A panoramic view of a futuristic city skyline at dusk, flying cars between glass towers,
 holographic billboards, cinematic lighting* (768x1280 bucket)
 
+### Image editing
+
+HunyuanImage-3.0-Instruct on Neuron (TP=16 × CFG=2, 50 steps, guidance 2.5, seed 42):
+condition images on the left (image 1 on top), output on the right. Inputs are from the
+[huggingface/documentation-images](https://huggingface.co/datasets/huggingface/documentation-images)
+dataset (`diffusers/cat.png`, `diffusers/astronaut.jpg`, `diffusers/gligen/livingroom_modern.png`).
+
+![edit cat wizard](images/hunyuan-image-3.0/edit_cat_wizard.jpg)
+
+*Put a red wizard hat on the cat and change the background to a starry night sky*
+
+![edit cat neon text](images/hunyuan-image-3.0/edit_cat_neon_text.jpg)
+
+*Replace the green background with a dark brick wall with a pink neon sign that reads "HELLO NEURON"*
+
+![edit astronaut](images/hunyuan-image-3.0/edit_astronaut_reef.jpg)
+
+*Change the scene to an underwater coral reef with colorful fish, keep the astronaut*
+
+![edit living room](images/hunyuan-image-3.0/edit_livingroom_winter.jpg)
+
+*Turn this living room into a cozy winter cabin with a lit fireplace and snow falling outside the window*
+
+![multi astronaut sofa](images/hunyuan-image-3.0/edit_multi_astronaut_sofa.jpg)
+
+*Place the astronaut from image 1 sitting on the orange sofa in the living room from image 2*
+
+![multi cat astronaut room](images/hunyuan-image-3.0/edit_multi_cat_astronaut_room.jpg)
+
+*The cat from image 1 and the astronaut from image 2 sitting together on the orange sofa in
+the living room from image 3*
+
+The official multi-image demo of the checkpoint (`assets/demo_instruct_imgs/input_1_*.png`,
+"基于图一的logo，参考图二中冰箱贴的材质，制作一个新的冰箱贴") also reproduces on Neuron: the
+logo of image 1 becomes an enamel fridge magnet in the material of image 2 (16.53 s warm).
+
 ## Known limitations
 
-- **Text-to-image only.** The automatic aspect ratio (`image_size="auto"`, which asks the
-  model for a ratio token first), the think / recaption prompt modes and image editing
-  (the separate HunyuanImage-3.0-Instruct checkpoint) are not implemented; pass an
-  explicit size.
+- **Direct generation only.** The think / recaption modes (the model first writes a
+  reasoning text or an enhanced prompt, autoregressively) and the automatic aspect ratio
+  (`image_size="auto"`, which asks the model for a ratio token) are not implemented: an
+  edit takes the first condition image's bucket, or the given size.
+- **Editing needs the Instruct checkpoint**; the base checkpoint is text-to-image only.
 - **Sizes are the checkpoint's resolution buckets.** Other sizes snap to the nearest
   bucket by aspect ratio, and each bucket compiles its own graphs on first use.
-- **Prompt length is static.** Prompts longer than `model_config.max_text_tokens`
-  (default 1024 tokens including the special tokens) are rejected; raise it in the stage
-  config (this recompiles).
+- **Prompt length is static** for the base checkpoint: prompts longer than
+  `model_config.max_text_tokens` (default 1024 tokens including the special tokens) are
+  rejected; raise it in the stage config (this recompiles). Instruct prefixes are padded
+  to a multiple of 1024 tokens, and each new padded length, condition-image size and
+  output size compiles its own graphs on first use (several minutes).
+- **Each edit layout holds its own device memory.** A new combination of condition-image
+  count and sizes and output size loads its own prefix, step and VAE graphs (about
+  1.5–2 GB per NeuronCore on top of about 15 GB for the weights); one process fits about
+  four such layouts before running out of device memory. Restart the server to serve
+  other layouts.
 - **Batch size is one** prompt and one image per request.
 - **16 or 32 NeuronCores.** The 160 GB of weights need TP >= 16, and TP must divide the
   64 experts and the 32 attention heads; the tested layouts are TP=16, TP=32 and

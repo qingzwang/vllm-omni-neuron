@@ -1,0 +1,19 @@
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    final_output: true
+    final_output_type: image
+    runtime:
+      process: true
+      devices: "0-31"
+      max_batch_size: 1
+    engine_args:
+      model_class_name: HunyuanImage3ForCausalMM
+      model_stage: diffusion
+      dtype: bfloat16
+      parallel_config:
+        # Per CFG replica: attention heads and the 64 experts sharded over 16 ranks
+        # (2 query heads and 4 experts per rank).
+        tensor_parallel_size: 16
+        # The conditional and unconditional rows on separate TP groups.
+        cfg_parallel_size: 2

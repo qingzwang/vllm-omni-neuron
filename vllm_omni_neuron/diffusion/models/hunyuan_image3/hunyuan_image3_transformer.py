@@ -36,7 +36,8 @@ Parallelism (one TP group):
   - Attention heads sharded over TP; with TP > 8 each KV head is replicated on
     TP / 8 ranks.
   - Experts sharded over the same ranks (expert parallelism, 64 / TP experts each,
-    blockwise NKI MoE kernel); the shared expert runs sequence-parallel.
+    blockwise NKI MoE kernel); the shared expert runs sequence-parallel (or, to save
+    memory, TP-sharded).
   - Megatron sequence parallelism: norms and residuals run on a 1/TP slice of the
     tokens; all-gather before attention/MoE, reduce-scatter after.
 """
@@ -346,7 +347,7 @@ class HunyuanImage3Attention(nn.Module):
 class HunyuanImage3MoE(nn.Module):
     """Softmax top-k routing over expert-parallel SwiGLU experts plus a shared expert."""
 
-    def __init__(self, config, dtype: torch.dtype):
+    def __init__(self, config, dtype: torch.dtype, shared_sequence_parallel: bool = True):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -362,8 +363,14 @@ class HunyuanImage3MoE(nn.Module):
             raise ValueError(f"{self.num_experts} experts do not shard over TP={self.tp_size}")
         self.num_local_experts = self.num_experts // self.tp_size
         self.expert_start = self.tp_rank * self.num_local_experts
-        # The shared expert runs sequence-parallel: full weights on each rank's tokens.
-        self.shared_inter = self.intermediate * shared
+        # The shared expert either runs sequence-parallel (full weights on each rank's
+        # tokens) or, to save 2.25 GB per rank at TP=16, with its intermediate dim
+        # sharded over TP on all tokens (summed with the routed experts).
+        self.shared_sp = shared_sequence_parallel
+        self.shared_full = self.intermediate * shared
+        if not self.shared_sp and self.shared_full % self.tp_size:
+            raise ValueError(f"the shared expert does not shard over TP={self.tp_size}")
+        self.shared_inter = self.shared_full // (1 if self.shared_sp else self.tp_size)
 
         # The reference keeps the router in float32.
         self.router_weight = nn.Parameter(
@@ -392,17 +399,20 @@ class HunyuanImage3MoE(nn.Module):
             gate_up.append(torch.stack([w[inter:].t(), w[:inter].t()], dim=1))  # [H, 2, I]
             down.append(ckpt.get(f"{prefix}experts.{e}.down_proj.weight").t())  # [I, H]
         shared = ckpt.get(f"{prefix}shared_mlp.gate_and_up_proj.weight")
+        shared_down = ckpt.get(f"{prefix}shared_mlp.down_proj.weight")
+        lo = 0 if self.shared_sp else self.tp_rank * self.shared_inter
+        hi = lo + self.shared_inter
         return {
             "router_weight": ckpt.get(f"{prefix}gate.wg.weight").float().t(),
             "gate_up_weight": torch.stack(gate_up),
             "down_weight": torch.stack(down),
-            "shared_gate_weight": shared[self.shared_inter :].t(),
-            "shared_up_weight": shared[: self.shared_inter].t(),
-            "shared_down_weight": ckpt.get(f"{prefix}shared_mlp.down_proj.weight").t(),
+            "shared_gate_weight": shared[self.shared_full + lo : self.shared_full + hi].t(),
+            "shared_up_weight": shared[lo:hi].t(),
+            "shared_down_weight": shared_down[:, lo:hi].t(),
         }
 
     def shared_expert(self, x: torch.Tensor) -> torch.Tensor:
-        """The shared expert on this rank's tokens ``[T / TP, H]``."""
+        """The shared expert (or its TP shard) on ``x``."""
         tokens = x.shape[0]
         # The NKI MLP kernel needs an even token count.
         h = F.pad(x, (0, 0, 0, tokens % 2)) if tokens % 2 else x
@@ -458,14 +468,14 @@ class HunyuanImage3MoE(nn.Module):
 
 
 class HunyuanImage3DecoderLayer(nn.Module):
-    def __init__(self, config, dtype: torch.dtype):
+    def __init__(self, config, dtype: torch.dtype, shared_sequence_parallel: bool = True):
         super().__init__()
         self.input_layernorm = HunyuanRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
         self.self_attn = HunyuanImage3Attention(config, dtype)
         self.post_attention_layernorm = HunyuanRMSNorm(
             config.hidden_size, config.rms_norm_eps, dtype
         )
-        self.mlp = HunyuanImage3MoE(config, dtype)
+        self.mlp = HunyuanImage3MoE(config, dtype, shared_sequence_parallel)
 
 
 # ----------------------------------------------------------------------
@@ -672,7 +682,13 @@ class NeuronHunyuanImage3Model(nn.Module):
     The token embedding table stays on the host; the caller embeds the prefix tokens.
     """
 
-    def __init__(self, config, dtype: torch.dtype = torch.bfloat16, num_layers: int | None = None):
+    def __init__(
+        self,
+        config,
+        dtype: torch.dtype = torch.bfloat16,
+        num_layers: int | None = None,
+        shared_sequence_parallel: bool = True,
+    ):
         super().__init__()
         self.config = config
         self._dtype = dtype
@@ -684,7 +700,10 @@ class NeuronHunyuanImage3Model(nn.Module):
         self.rope_theta = config.rope_theta
         self.num_layers = num_layers or config.num_hidden_layers
         self.layers = nn.ModuleList(
-            [HunyuanImage3DecoderLayer(config, dtype) for _ in range(self.num_layers)]
+            [
+                HunyuanImage3DecoderLayer(config, dtype, shared_sequence_parallel)
+                for _ in range(self.num_layers)
+            ]
         )
         latent = config.vae["latent_channels"]
         self.latent_channels = latent
@@ -761,6 +780,9 @@ class NeuronHunyuanImage3Model(nn.Module):
     def _mlp(self, layer, x: torch.Tensor) -> torch.Tensor:
         h = layer.post_attention_layernorm(x)
         routed = layer.mlp(_all_gather(h, self.tp_group, self.tp_size))
+        if not layer.mlp.shared_sp:
+            routed = routed + layer.mlp.shared_expert(_all_gather(h, self.tp_group, self.tp_size))
+            return x + _reduce_scatter(routed, self.tp_group, self.tp_size)
         return x + _reduce_scatter(routed, self.tp_group, self.tp_size) + layer.mlp.shared_expert(h)
 
     def forward_prefix(self, embeds: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
@@ -772,7 +794,56 @@ class NeuronHunyuanImage3Model(nn.Module):
         """
         rows, length, hidden = embeds.shape
         x = self._shard(embeds.reshape(rows * length, hidden))
+        return self._prefix_layers(x, rows, length, cos, sin)
+
+    def forward_prefix_edit(self, embeds, cos, sin, bound_max, t0, latents, vit_tokens, layout):
+        """Prefix K/V of an edit (text and condition images), for ``R`` rows.
+
+        ``embeds`` ``[R, P, H]`` holds the text embeddings (zeros at the image slots);
+        each condition image ``k`` contributes its latents ``[1, C, h_k, w_k]`` (patch
+        embedded at timestep ``t0`` = 0), its SigLIP2 tokens ``[1024, H]`` and a
+        ``<timestep>`` token, at the static positions ``layout[k] = (timestep, vae, vit)``.
+        ``bound_max`` ``[P_pad, 1]`` gives each query's key range (causal, full within a
+        condition image's joint span).
+        """
+        rows, length, hidden = embeds.shape
+        t0 = t0.expand(1)
+        temb = self.time_embed(t0)
+        timestep = self.timestep_emb(t0)  # [1, H]
+        # Rank 0 holds the text, SigLIP2 and <timestep> embeddings; every rank its
+        # partial sum of the patch embedding; the reduce-scatter adds them up. The image
+        # slots are written with two index copies.
+        lead = self.tp_rank == 0
+        lead_index, lead_values, image_index, image_values = [], [], [], []
+        for (ts_pos, vae_pos, vit_pos), lat, vit in zip(layout, latents, vit_tokens):
+            image = self.patch_embed(lat.to(self._dtype), temb)[0]  # [h*w, H]
+            image_index.append(torch.arange(vae_pos, vae_pos + image.shape[0], device=image.device))
+            image_values.append(image)
+            lead_index += [
+                torch.arange(ts_pos, ts_pos + 1, device=image.device),
+                torch.arange(vit_pos, vit_pos + vit.shape[0], device=image.device),
+            ]
+            lead_values += [timestep.to(self._dtype), vit.to(self._dtype)]
+        out_rows = []
+        for r in range(rows):
+            row = embeds[r] if lead else torch.zeros_like(embeds[r])
+            if image_values:
+                row = row.index_copy(0, torch.cat(image_index), torch.cat(image_values))
+                if lead:
+                    row = row.index_copy(0, torch.cat(lead_index), torch.cat(lead_values))
+            out_rows.append(row)
+        x = torch.cat(out_rows)
+        x = _reduce_scatter(x, self.tp_group, self.tp_size)
+        return self._prefix_layers(x, rows, length, cos, sin, bound_max)
+
+    def _prefix_layers(self, x, rows, length, cos, sin, bound_max=None):
+        """Every layer's K/V ``[layers, R, kv_heads, P, D]`` of the SP-sharded prefix ``x``.
+
+        Causal attention, or with ``bound_max`` each query's keys ``[0, bound_max)``.
+        """
         cos, sin = cos.repeat(rows, 1), sin.repeat(rows, 1)
+        if bound_max is not None:
+            bound_min = torch.zeros_like(bound_max)
         keys, values = [], []
         for i, layer in enumerate(self.layers):
             attn = layer.self_attn
@@ -782,16 +853,16 @@ class NeuronHunyuanImage3Model(nn.Module):
             values.append(v.view(attn.num_kv_heads, rows, length, -1).transpose(0, 1))
             if i == len(self.layers) - 1:
                 break  # the last layer's output is not needed
-            out = torch.cat(
-                [
-                    attn.attend_causal(
-                        q[:, r * length : (r + 1) * length],
-                        k[:, r * length : (r + 1) * length],
-                        v[:, r * length : (r + 1) * length],
+            out = []
+            for r in range(rows):
+                row = slice(r * length, (r + 1) * length)
+                if bound_max is None:
+                    out.append(attn.attend_causal(q[:, row], k[:, row], v[:, row]))
+                else:
+                    out.append(
+                        attn.attend_bounded(q[:, row], k[:, row], v[:, row], bound_min, bound_max)
                     )
-                    for r in range(rows)
-                ]
-            )
+            out = torch.cat(out)
             x = x + _reduce_scatter(torch.matmul(out, attn.o_weight), self.tp_group, self.tp_size)
             x = self._mlp(layer, x)
         return torch.stack(keys), torch.stack(values)
@@ -868,12 +939,21 @@ class NeuronHunyuanImage3Model(nn.Module):
         self._compiled_prefix = torch.compile(
             self.forward_prefix, *args, options=prefix_options, **kwargs
         )
+        edit_options = {**(prefix_options or {})}
+        edit_options["model_name"] = f"{edit_options.get('model_name', 'prefix')}_edit"
+        self._compiled_prefix_edit = torch.compile(
+            self.forward_prefix_edit, *args, options=edit_options, **kwargs
+        )
         self._compiled_step = torch.compile(
             self.forward_step, *args, options=step_options, **kwargs
         )
 
     def prefix(self, *args):
         fn = self._compiled_prefix if self._compiled_prefix is not None else self.forward_prefix
+        return fn(*args)
+
+    def prefix_edit(self, *args):
+        fn = getattr(self, "_compiled_prefix_edit", None) or self.forward_prefix_edit
         return fn(*args)
 
     def step(self, *args):

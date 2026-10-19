@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NeuronHunyuanImage3Pipeline — HunyuanImage-3.0 text-to-image for Neuron.
+"""NeuronHunyuanImage3Pipeline — HunyuanImage-3.0 text-to-image and editing for Neuron.
 
 Replaces vllm-omni's ``HunyuanImage3Pipeline`` (architecture ``HunyuanImage3ForCausalMM``)
-and follows the official ``generate_image`` of the checkpoint for text-to-image with an
-explicit size (no think/recaption pass, no system prompt, ``pretrain`` template):
+and follows the official ``generate_image`` of the checkpoints with direct generation
+(no think/recaption pass) at an explicit or derived size. For the base checkpoint
+(text-to-image, ``pretrain`` template, no system prompt):
 
 1. The prompt becomes ``<bos> prompt <boi> <img_size_1024> <img_ratio_k>``; the
    unconditional (CFG) row replaces every prompt token with ``<cfg>``. The rows are
@@ -14,10 +15,18 @@ explicit size (no think/recaption pass, no system prompt, ``pretrain`` template)
 4. The VAE decoder (compiled per stage) decodes the last frame, its up levels split
    into row strips over all ranks.
 
-Sizes snap to the checkpoint's 33 resolution buckets around 1024x1024 (as the official
-image processor does); the flow-matching schedule is the official one
-(``sigma = linspace(1, 0, steps + 1)`` with shift 3), as is the guidance
-``uncond + scale * (cond - uncond)`` (scale 5 by default).
+The Instruct checkpoint (``instruct`` template, unified system prompt) also takes
+condition images (``multi_modal_data["image"]``) to edit: each is encoded by the VAE
+encoder (latent tokens at t = 0) and the SigLIP2 tower, and the prefix graph runs the
+system prompt, the condition images and the instruction, with each image's tokens
+attending to each other bidirectionally (see ``hunyuan_image3_edit``). Steps 2-4 are
+unchanged.
+
+Sizes snap to the checkpoint's resolution buckets around 1024x1024 (as the official
+image processor does); an edit defaults to the first condition image's bucket. The
+flow-matching schedule is the official one (``sigma = linspace(1, 0, steps + 1)`` with
+shift 3), as is the guidance ``uncond + scale * (cond - uncond)`` (scale 5, or 2.5 for
+Instruct, by default; taken from the checkpoint's generation config).
 """
 
 import json
@@ -30,19 +39,25 @@ import torch
 import torch.distributed as dist
 from diffusers.image_processor import VaeImageProcessor
 from torch import nn
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, Siglip2ImageProcessor
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.models.hunyuan_image3.system_prompt import get_system_prompt
 
 from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_kl_hunyuanimage3 import (
     HunyuanImage3Decoder,
+    HunyuanImage3Encoder,
 )
+from vllm_omni_neuron.diffusion.models.hunyuan_image3 import hunyuan_image3_edit as edit
 from vllm_omni_neuron.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
     Checkpoint,
     NeuronHunyuanImage3Model,
     step_layout,
     text_rope,
+)
+from vllm_omni_neuron.diffusion.models.hunyuan_image3.hunyuan_image3_vision import (
+    HunyuanImage3VisionEncoder,
 )
 from vllm_omni_neuron.lite_compat import is_lite_runtime
 
@@ -65,6 +80,9 @@ _FLOW_SHIFT = 3.0
 # Static number of prefix tokens (<bos>, prompt, <boi>, size and ratio tokens) in the
 # compiled graphs unless the stage config's model_config sets ``max_text_tokens``.
 _DEFAULT_MAX_TEXT_TOKENS = 1024
+# Instruct prefixes (system prompt, condition images) are padded to a multiple of this,
+# so a new prefix graph compiles only when the padded length changes.
+_PREFIX_MULTIPLE = 1024
 
 _COMPILER_ARGS = ["--model-type=transformer", "--auto-cast=none", "-O1"]
 _VAE_COMPILER_ARGS = [
@@ -77,7 +95,8 @@ _RECOMPILE_LIMIT = 64
 
 
 def get_hunyuan_image3_pre_process_func(od_config):
-    """Text-to-image requests need no pre-processing (replaces vllm-omni's image-conditioning one)."""
+    """No pre-processing: the pipeline prepares condition images itself (this replaces
+    vllm-omni's)."""
 
     def pre_process_func(request):
         return request
@@ -138,7 +157,10 @@ def _model_path(model: str) -> str:
 
 
 class NeuronHunyuanImage3Pipeline(nn.Module):
-    """HunyuanImage-3.0 text-to-image on Neuron (TP + expert parallelism)."""
+    """HunyuanImage-3.0 text-to-image and (Instruct) image editing on Neuron."""
+
+    # Requests may carry condition images (multi_modal_data["image"]) to edit.
+    support_image_input = True
 
     weights_sources: list = []
 
@@ -168,25 +190,55 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         self.ratio_offset = ids("<img_ratio_0>")
         self.pad_id = config.pad_token_id
         self.buckets = resolution_buckets()
+        gen_path = os.path.join(self.model_path, "generation_config.json")
+        gen = json.load(open(gen_path)) if os.path.exists(gen_path) else {}
+        self.default_steps = int(gen.get("diff_infer_steps", _DEFAULT_STEPS))
+        self.default_guidance = float(gen.get("diff_guidance_scale", _DEFAULT_GUIDANCE))
+        # The Instruct checkpoint: instruct template, system prompt, condition images.
+        self.instruct = gen.get("sequence_template") == "instruct"
+        if self.instruct:
+            self.edit_buckets = edit.instruct_buckets(self.buckets)
+            self.tokens = edit.InstructTokens(self.tokenizer, self.bos_id)
+            prompt = get_system_prompt(gen.get("use_system_prompt", "None"), "image", None)
+            self.system_prompt = (prompt or "").strip()
+            self.vit_processor = Siglip2ImageProcessor.from_dict(config.vit_processor)
 
-        self.transformer = NeuronHunyuanImage3Model(config, dtype=dtype, num_layers=num_layers)
+        # Instruct also holds the vision tower, the VAE encoder and the larger edit
+        # graphs: shard its shared expert over TP to keep memory headroom.
+        self.transformer = NeuronHunyuanImage3Model(
+            config, dtype=dtype, num_layers=num_layers, shared_sequence_parallel=not self.instruct
+        )
         self.latent_channels = self.transformer.latent_channels
         self.is_output_rank = not dist.is_initialized() or dist.get_rank() == 0
         # Every rank decodes a row strip of the image.
         self.vae = HunyuanImage3Decoder(config.vae, dtype=dtype)
         world = get_world_group()
         self.vae.set_parallel(world.device_group, world.world_size, world.rank_in_group)
+        self.vision = self.vae_encoder = None
+        if self.instruct:
+            # Condition images: the SigLIP2 tower (replicated) and the VAE encoder (row
+            # strips over all ranks, like the decoder).
+            self.vision = HunyuanImage3VisionEncoder(config.vit, config.vit_aligner, dtype)
+            self.vae_encoder = HunyuanImage3Encoder(config.vae, dtype=dtype)
+            self.vae_encoder.set_parallel(world.device_group, world.world_size, world.rank_in_group)
         self.image_processor = VaeImageProcessor(vae_scale_factor=_VAE_SCALE_FACTOR)
         self.last_stage_seconds: dict[str, float] = {}
 
+    def _components(self):
+        return [m for m in (self.transformer, self.vae, self.vision, self.vae_encoder) if m]
+
     def to(self, *args, **kwargs):
-        self.transformer.to(*args, **kwargs)
-        self.vae.to(*args, **kwargs)
+        for module in self._components():
+            module.to(*args, **kwargs)
         return self
 
     def load_weights(self, weights=None):
         self.transformer.load_weights(self.model_path)
-        self.vae.load_weights(Checkpoint(self.model_path))
+        ckpt = Checkpoint(self.model_path)
+        self.vae.load_weights(ckpt)
+        if self.instruct:
+            self.vision.load_weights(ckpt)
+            self.vae_encoder.load_weights(ckpt)
         return None
 
     def compile(self, *args, **kwargs):
@@ -209,6 +261,11 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             **kwargs,
         )
         self.vae.compile(*args, options=_opts("hunyuan_image3_vae", _VAE_COMPILER_ARGS), **kwargs)
+        if self.instruct:
+            self.vision.compile(*args, options=_opts("hunyuan_image3_vision"), **kwargs)
+            self.vae_encoder.compile(
+                *args, options=_opts("hunyuan_image3_vae_encoder", _VAE_COMPILER_ARGS), **kwargs
+            )
         return self
 
     # ------------------------------------------------------------------
@@ -237,6 +294,58 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             ids[i, :length] = torch.tensor(row)
         return ids, length
 
+    @staticmethod
+    def _condition_images(prompt) -> list:
+        if isinstance(prompt, str):
+            return []
+        images = (prompt.get("multi_modal_data") or {}).get("image")
+        if images is None:
+            return []
+        return list(images) if isinstance(images, (list, tuple)) else [images]
+
+    def _own_rows(self, ids: torch.Tensor, cfg: bool) -> torch.Tensor:
+        """Under CFG parallelism this replica's row (both run the conditional row when
+        guidance is off)."""
+        model = self.transformer
+        if model.cfg_size == 1:
+            return ids
+        return ids[model.cfg_rank : model.cfg_rank + 1] if cfg else ids[:1]
+
+    def _prefix_instruct(self, prompt, conditions, ratio_index, cfg, generator):
+        """Instruct prefix K/V: system prompt, condition images, instruction."""
+        model, device = self.transformer, self.device
+        prefix = edit.edit_prefix(
+            self.tokens, self.system_prompt, prompt, conditions, ratio_index, cfg
+        )
+        length = prefix.ids.shape[1]
+        padded = -(-length // _PREFIX_MULTIPLE) * _PREFIX_MULTIPLE
+        ids = torch.full((prefix.ids.shape[0], padded), self.pad_id, dtype=torch.long)
+        ids[:, :length] = prefix.ids
+        ids = self._own_rows(ids, cfg)
+        cos, sin = edit.prefix_rope(prefix, conditions, model.head_dim, model.rope_theta, padded)
+        bound_max = edit.prefix_bounds(prefix, padded)
+        # Condition images: VAE latents (the official sampling noise is drawn first,
+        # image by image, from the request's generator) and SigLIP2 tokens.
+        latents, vit_tokens = [], []
+        for cond in conditions:
+            h, w = cond.latent_hw
+            eps = torch.randn((1, self.latent_channels, h, w), generator=generator)
+            latents.append(self.vae_encoder.encode(cond.vae_pixels.to(device), eps.to(device)))
+            vit_tokens.append(self.vision(cond.vit_pixels, cond.vit_hw, device))
+            _wait_for(vit_tokens[-1])
+        layout = tuple(zip(prefix.timestep_pos, prefix.vae_pos, prefix.vit_pos))
+        text_k, text_v = model.prefix_edit(
+            model.embed(ids).to(device),
+            cos.to(device),
+            sin.to(device),
+            bound_max.to(device),
+            torch.zeros(1).to(device),
+            latents,
+            vit_tokens,
+            layout,
+        )
+        return text_k, text_v, length, ids.shape[0]
+
     def forward(self, req) -> DiffusionOutput:
         if req.request_ids == ["dummy_req_id"] and self._prompt_of(req.prompts[0]) == "dummy run":
             logger.info("Skipping warmup request on Neuron pipeline")
@@ -247,45 +356,70 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         if (sp.num_outputs_per_prompt or 1) > 1:
             raise NotImplementedError("num_outputs_per_prompt > 1 is not supported")
         prompt = self._prompt_of(req.prompts[0])
-        if not isinstance(req.prompts[0], str) and (req.prompts[0].get("multi_modal_data") or {}):
-            raise NotImplementedError("HunyuanImage-3.0 on Neuron supports text-to-image only")
-
-        req_h, req_w = sp.height or _BASE_SIZE, sp.width or _BASE_SIZE
-        height, width, ratio_index = snap_size(req_h, req_w, self.buckets)
+        images = self._condition_images(req.prompts[0])
+        if images and not self.instruct:
+            raise NotImplementedError(
+                "image editing needs the HunyuanImage-3.0-Instruct checkpoint"
+            )
+        conditions = [
+            edit.prepare_condition(image, self.edit_buckets, self.vit_processor) for image in images
+        ]
+        buckets = self.edit_buckets if self.instruct else self.buckets
+        if conditions and not (sp.height and sp.width):
+            # As vllm-omni: the output takes the first condition image's bucket.
+            req_h, req_w = buckets[conditions[0].ratio_index]
+        else:
+            req_h, req_w = sp.height or _BASE_SIZE, sp.width or _BASE_SIZE
+        height, width, ratio_index = snap_size(req_h, req_w, buckets)
         if (height, width) != (req_h, req_w):
             logger.info(
                 "HunyuanImage-3.0: %dx%d snaps to the %dx%d bucket", req_h, req_w, height, width
             )
         latent_h, latent_w = height // _VAE_SCALE_FACTOR, width // _VAE_SCALE_FACTOR
-        num_steps = sp.num_inference_steps or _DEFAULT_STEPS
+        if self.instruct:
+            # Prefix (system prompt, condition images, instruction) + the generated image.
+            total = len(self.tokenizer.encode(self.system_prompt + prompt)) + 16
+            total += sum(c.latent_hw[0] * c.latent_hw[1] + 1030 for c in conditions)
+            total += latent_h * latent_w
+            if total > self.config.max_position_embeddings:
+                raise ValueError(
+                    f"{len(conditions)} condition images and the output need about {total} "
+                    f"positions; the model has {self.config.max_position_embeddings}"
+                )
+        num_steps = sp.num_inference_steps or self.default_steps
         guidance = (
             sp.guidance_scale
             if getattr(sp, "guidance_scale_provided", False)
-            else _DEFAULT_GUIDANCE
+            else self.default_guidance
         )
         do_cfg = guidance > 1.0
         model = self.transformer
         device = self.device
         timings: dict[str, float] = {}
 
-        t0 = time.perf_counter()
-        ids, prefix_len = self._prefix_ids(prompt, ratio_index, do_cfg)
-        if model.cfg_size > 1:
-            # CFG parallelism: this replica's row (both replicas run the conditional
-            # row when guidance is off).
-            ids = ids[model.cfg_rank : model.cfg_rank + 1] if do_cfg else ids[:1]
-        embeds = model.embed(ids).to(device)
-        cos, sin = text_rope(self.max_text_tokens, model.head_dim, model.rope_theta)
-        text_k, text_v = model.prefix(embeds, cos.to(device), sin.to(device))
-        _wait_for(text_k)
-        timings["prefix_seconds"] = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
         if sp.seed is not None:
             generator = torch.Generator("cpu").manual_seed(sp.seed)
         else:
             generator = sp.generator[0] if isinstance(sp.generator, list) else sp.generator
-        # As the official pipeline: bf16 noise, float32 latents from the first update on.
+
+        t0 = time.perf_counter()
+        if self.instruct:
+            text_k, text_v, prefix_len, rows = self._prefix_instruct(
+                prompt, conditions, ratio_index, do_cfg, generator
+            )
+        else:
+            ids, prefix_len = self._prefix_ids(prompt, ratio_index, do_cfg)
+            ids = self._own_rows(ids, do_cfg)
+            rows = ids.shape[0]
+            embeds = model.embed(ids).to(device)
+            cos, sin = text_rope(self.max_text_tokens, model.head_dim, model.rope_theta)
+            text_k, text_v = model.prefix(embeds, cos.to(device), sin.to(device))
+        _wait_for(text_k)
+        timings["prefix_seconds"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        # As the official pipeline: bf16 noise (drawn after the condition latents'),
+        # float32 latents from the first update on.
         latents = torch.randn(
             (1, self.latent_channels, latent_h, latent_w), generator=generator, dtype=torch.bfloat16
         )
@@ -296,7 +430,7 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             latent_w,
             model.head_dim,
             model.rope_theta,
-            rows=ids.shape[0],
+            rows=rows,
             tp_size=model.tp_size,
         )
         cos, sin = cos.to(device), sin.to(device)

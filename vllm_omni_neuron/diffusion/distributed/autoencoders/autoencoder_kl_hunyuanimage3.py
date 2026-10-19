@@ -39,22 +39,42 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni_neuron.lite_compat import is_lite_runtime
+
 logger = logging.getLogger(__name__)
+
+
+def _wait_for(tensor: torch.Tensor) -> None:
+    """Block until ``tensor`` is computed, so that the stages of several images do not
+    overflow Lite's asynchronous execution queue."""
+    if is_lite_runtime():
+        source = tensor.reshape(-1)[:1]
+        torch.empty_like(source).copy_(source)
+
 
 # 3x3 convolutions per up level: 3 ResnetBlocks x 2, plus the upsample conv (or, for
 # the last level, conv_out).
 _HALO = 7
+# The last up levels run as one strip graph, so their large intermediates (up to 128
+# channels x 4 frames x the image) are never gathered: each fused level's halo also
+# covers, after its 2x upsampling, the next one's.
+_FUSED_LEVELS = 3
+_FUSED_HALOS = [_HALO]
+for _ in range(_FUSED_LEVELS - 1):
+    _FUSED_HALOS.insert(0, _HALO + (_FUSED_HALOS[0] + 1) // 2)
 
 
 class _Strip:
     """A rank's row strip of an up level: own rows ``[halo, halo + own)`` of the strip."""
 
-    def __init__(self, rows_index: torch.Tensor, own: int, image_rows: int, group, world: int):
-        self.own = own
+    def __init__(
+        self, rows_index: torch.Tensor, own: int, image_rows: int, group, world: int, halo: int
+    ):
+        self.own, self.halo = own, halo
         self.group, self.world = group, world
-        rows = rows_index - _HALO  # image row of each strip row
+        rows = rows_index - halo  # image row of each strip row
         self.mask = ((rows >= 0) & (rows < image_rows))[None, None, :, None]
-        self.own_mask = self.mask[:, :, _HALO : _HALO + own]
+        self.own_mask = self.mask[:, :, halo : halo + own]
         self.image_rows = image_rows
 
     def zero_outside(self, x: torch.Tensor) -> torch.Tensor:
@@ -114,7 +134,7 @@ class _GroupNorm(nn.Module):
             mean = g.mean(dim=(0, 2, 3, 4), keepdim=True)
             var = (g - mean).pow(2).mean(dim=(0, 2, 3, 4), keepdim=True)
         else:
-            own = g[:, :, :, _HALO : _HALO + strip.own]
+            own = g[:, :, :, strip.halo : strip.halo + strip.own]
             weight = strip.own_mask.float()[:, :, None]  # [1, 1, 1, own, 1]
             count = frames * (channels // self.groups) * strip.image_rows * width
             total = strip.all_reduce((own * weight).sum(dim=(0, 2, 3, 4)))
@@ -300,7 +320,7 @@ class HunyuanImage3Decoder(nn.Module):
         rows = x.shape[2]
         own = rows_index.shape[0] - 2 * _HALO
         padded = F.pad(x, (0, 0, _HALO, _HALO + own * self._world - rows))
-        strip = _Strip(rows_index, own, rows, self._group, self._world)
+        strip = _Strip(rows_index, own, rows, self._group, self._world, _HALO)
         h = padded.index_select(2, rows_index)
         level = self.up[index]
         for block in level.block:
@@ -315,6 +335,34 @@ class HunyuanImage3Decoder(nn.Module):
         out = _gather_rows(h[:, :, own_rows].contiguous(), self._group, self._world)
         return out[:, :, :rows]
 
+    def _last_levels(self, x: torch.Tensor, rows_index: torch.Tensor) -> torch.Tensor:
+        """The last ``_FUSED_LEVELS`` up levels (with the output norm and conv) on one
+        strip, returning the gathered last frame."""
+        first = len(self.up) - _FUSED_LEVELS
+        rows = x.shape[2]
+        halo = _FUSED_HALOS[0]
+        own = rows_index.shape[0] - 2 * halo
+        padded = F.pad(x, (0, 0, halo, halo + own * self._world - rows))
+        h = padded.index_select(2, rows_index)
+        for k in range(_FUSED_LEVELS):
+            strip = _Strip(rows_index, own, rows, self._group, self._world, halo)
+            level = self.up[first + k]
+            for block in level.block:
+                h = block(h, strip)
+            if k == _FUSED_LEVELS - 1:
+                break
+            h = level.upsample(h, strip)
+            # The next level's strip: its own rows (2x) and halo, still exact.
+            nxt = _FUSED_HALOS[k + 1]
+            own, rows = 2 * own, 2 * rows
+            start = 2 * halo - nxt
+            h = h[:, :, start : start + own + 2 * nxt]
+            rows_index = torch.arange(own + 2 * nxt, device=h.device) + 2 * (rows_index[0])
+            halo = nxt
+        h = self.conv_out(_swish(self.norm_out(h, strip)), strip)[-1:]
+        out = _gather_rows(h[:, :, halo : halo + own].contiguous(), self._group, self._world)
+        return out[:, :, :rows]
+
     def compile(self, *args, **kwargs):
         options = dict(kwargs.pop("options", None) or {})
         name = options.get("model_name", "vae")
@@ -325,10 +373,11 @@ class HunyuanImage3Decoder(nn.Module):
             )
 
         self._compiled["head"] = _compile(self._head, "head")
-        for i in range(len(self.up)):
+        for i in range(len(self.up) - _FUSED_LEVELS):
             self._compiled[f"up{i}"] = _compile(
                 lambda x, rows_index, i=i: self._level(i, x, rows_index), f"up{i}"
             )
+        self._compiled["last"] = _compile(self._last_levels, "last")
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """``latents`` ``[1, C_z, h, w]`` (model space) -> image ``[1, 3, 16h, 16w]`` in [-1, 1].
@@ -337,10 +386,174 @@ class HunyuanImage3Decoder(nn.Module):
         """
         head = self._compiled.get("head", self._head)
         h = head(latents)
-        for i in range(len(self.up)):
+        for i in range(len(self.up) - _FUSED_LEVELS):
             rows = h.shape[2]
             own = math.ceil(rows / self._world)
             rows_index = torch.arange(own + 2 * _HALO) + self._rank * own
             level = self._compiled.get(f"up{i}", lambda x, r, i=i: self._level(i, x, r))
             h = level(h, rows_index.to(h.device))
-        return h
+            _wait_for(h)
+        own = math.ceil(h.shape[2] / self._world)
+        rows_index = torch.arange(own + 2 * _FUSED_HALOS[0]) + self._rank * own
+        return self._compiled.get("last", self._last_levels)(h, rows_index.to(h.device))
+
+
+# ----------------------------------------------------------------------
+# Encoder (condition images of HunyuanImage-3.0-Instruct)
+# ----------------------------------------------------------------------
+
+# Encoder down levels have at most 6 3x3 convolutions (conv_in, 2 ResnetBlocks and the
+# downsample conv); an even halo keeps the strips aligned with the 2x2 space-to-depth.
+_ENC_HALO = 6
+
+
+def _space_to_depth(x: torch.Tensor, temporal: bool) -> torch.Tensor:
+    # b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w
+    frames, channels, height, width = x.shape
+    r1 = 2 if temporal else 1
+    x = x.view(frames // r1, r1, channels, height // 2, 2, width // 2, 2)
+    return x.permute(0, 1, 4, 6, 2, 3, 5).reshape(
+        frames // r1, r1 * 4 * channels, height // 2, width // 2
+    )
+
+
+class DownsampleDCAE(nn.Module):
+    """Conv to ``out / factor`` channels, space-to-depth, plus a channel-group-mean shortcut."""
+
+    def __init__(self, in_ch: int, out_ch: int, temporal: bool, dtype: torch.dtype):
+        super().__init__()
+        self.temporal = temporal
+        factor = 8 if temporal else 4
+        self.conv = _Conv3d(in_ch, out_ch // factor, 3, dtype)
+        self.group_size = factor * in_ch // out_ch
+
+    def forward(self, x: torch.Tensor, strip: _Strip | None = None) -> torch.Tensor:
+        h = _space_to_depth(self.conv(x, strip), self.temporal)
+        shortcut = _space_to_depth(x, self.temporal)
+        frames, channels, height, width = shortcut.shape
+        shortcut = shortcut.view(frames, h.shape[1], self.group_size, height, width).mean(dim=2)
+        return h + shortcut
+
+
+class _DownLevel(nn.Module):
+    def __init__(self, blocks, downsample):
+        super().__init__()
+        self.block = nn.ModuleList(blocks)
+        if downsample is not None:
+            self.downsample = downsample
+
+
+class HunyuanImage3Encoder(nn.Module):
+    """``Encoder`` of ``AutoencoderKLConv3D`` (parameter names match ``vae.encoder.*``).
+
+    An image ``[1, 3, H, W]`` is repeated to 4 frames (``ffactor_temporal``), as the
+    reference does for a single image; the downsampling levels run as row strips over
+    the ranks (see the module docstring), the last level, the mid block and the output
+    on the full latent grid on every rank.
+    """
+
+    def __init__(self, vae_config: dict, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        channels = list(vae_config["block_out_channels"])
+        self.z_channels = vae_config["latent_channels"]
+        self.scaling_factor = vae_config["scaling_factor"]
+        self.frames = int(vae_config["ffactor_temporal"])
+        num_res = vae_config["layers_per_block"]
+        spatial_levels = int(vae_config["ffactor_spatial"]).bit_length() - 1
+        temporal_skip = (int(vae_config["ffactor_spatial"]) // self.frames).bit_length() - 1
+        if 2 * num_res + 2 > _ENC_HALO:
+            raise ValueError(
+                f"the encoder strip halo assumes <= {_ENC_HALO} convolutions per level"
+            )
+        self._dtype = dtype
+        self.conv_in = _Conv3d(vae_config["in_channels"], channels[0], 3, dtype)
+        self.down = nn.ModuleList()
+        block_in = channels[0]
+        for level, ch in enumerate(channels):
+            blocks = []
+            for _ in range(num_res):
+                blocks.append(ResnetBlock(block_in, ch, dtype))
+                block_in = ch
+            downsample = None
+            if level < spatial_levels:
+                out = channels[level + 1]
+                downsample = DownsampleDCAE(block_in, out, level >= temporal_skip, dtype)
+                block_in = out
+            self.down.append(_DownLevel(blocks, downsample))
+        self.mid = _Mid(block_in, dtype)
+        self.norm_out = _GroupNorm(block_in, dtype)
+        self.conv_out = _Conv3d(block_in, 2 * self.z_channels, 3, dtype)
+        self.num_strip_levels = spatial_levels
+        self._compiled: dict[str, object] = {}
+        self._group, self._world, self._rank = None, 1, 0
+
+    def set_parallel(self, group, world: int, rank: int) -> None:
+        self._group, self._world, self._rank = group, world, rank
+
+    def load_weights(self, checkpoint, prefix: str = "vae.encoder.") -> None:
+        state = {
+            name: checkpoint.get(prefix + name).to(self._dtype)
+            for name, _ in self.named_parameters()
+        }
+        self.load_state_dict(state, strict=True, assign=True)
+
+    def _level(self, index: int, x: torch.Tensor, rows_index: torch.Tensor) -> torch.Tensor:
+        """Down level ``index`` (with ``conv_in`` before level 0) on this rank's strip."""
+        rows = x.shape[2]
+        own = rows_index.shape[0] - 2 * _ENC_HALO
+        padded = F.pad(x, (0, 0, _ENC_HALO, _ENC_HALO + own * self._world - rows))
+        strip = _Strip(rows_index, own, rows, self._group, self._world, _ENC_HALO)
+        h = padded.index_select(2, rows_index)
+        if index == 0:
+            h = self.conv_in(h.to(self._dtype).expand(self.frames, -1, -1, -1), strip)
+        level = self.down[index]
+        for block in level.block:
+            h = block(h, strip)
+        h = level.downsample(h, strip)
+        half = _ENC_HALO // 2
+        out = _gather_rows(h[:, :, half : half + own // 2].contiguous(), self._group, self._world)
+        return out[:, :, : rows // 2]
+
+    def _tail(self, h: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        """Remaining levels, mid block and output: a latent sample in model space."""
+        for level in self.down[self.num_strip_levels :]:
+            for block in level.block:
+                h = block(h)
+        h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h)))
+        group = h.shape[1] // (2 * self.z_channels)
+        shortcut = h.view(h.shape[0], 2 * self.z_channels, group, *h.shape[2:]).mean(dim=2)
+        h = self.conv_out(_swish(self.norm_out(h))) + shortcut
+        mean, logvar = h.float().chunk(2, dim=1)
+        std = torch.exp(0.5 * logvar.clamp(-30.0, 20.0))
+        return (mean + std * eps) * self.scaling_factor
+
+    def compile(self, *args, **kwargs):
+        options = dict(kwargs.pop("options", None) or {})
+        name = options.get("model_name", "vae_encoder")
+
+        def _compile(fn, suffix):
+            return torch.compile(
+                fn, *args, options={**options, "model_name": f"{name}_{suffix}"}, **kwargs
+            )
+
+        for i in range(self.num_strip_levels):
+            self._compiled[f"down{i}"] = _compile(
+                lambda x, rows_index, i=i: self._level(i, x, rows_index), f"down{i}"
+            )
+        self._compiled["tail"] = _compile(self._tail, "tail")
+
+    def encode(self, pixels: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+        """``pixels`` ``[1, 3, H, W]`` in [-1, 1], ``eps`` ``[1, C_z, H/16, W/16]`` standard
+        normal -> latents ``[1, C_z, H/16, W/16]`` (``(mean + std * eps) * scaling``).
+
+        With :meth:`set_parallel`, every rank of the group must call it.
+        """
+        h = pixels
+        for i in range(self.num_strip_levels):
+            rows = h.shape[2]
+            own = 2 * math.ceil(rows / (2 * self._world))
+            rows_index = torch.arange(own + 2 * _ENC_HALO) + self._rank * own
+            level = self._compiled.get(f"down{i}", lambda x, r, i=i: self._level(i, x, r))
+            h = level(h, rows_index.to(h.device))
+            _wait_for(h)
+        return self._compiled.get("tail", self._tail)(h, eps)
