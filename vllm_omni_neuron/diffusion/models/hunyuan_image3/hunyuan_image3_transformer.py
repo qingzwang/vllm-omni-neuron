@@ -66,7 +66,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm_neuron.functional.moe.moe_cte import MoECTEImplementation
-from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group
+from vllm_omni.diffusion.distributed.parallel_state import get_cfg_group, get_world_group
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +425,48 @@ class HunyuanImage3MoE(nn.Module):
         out = NF.mlp(h, self.shared_gate_weight, self.shared_up_weight, self.shared_down_weight)
         return out[:tokens] if tokens % 2 else out
 
+    def decode(self, x: torch.Tensor, part: int = 0, parts: int = 1) -> torch.Tensor:
+        """Routed experts for one token ``x`` ``[1, H]`` -> this rank's partial sum.
+
+        At one token the experts are bound by reading their weights: every local expert
+        is computed densely and weighted by its affinity (zero unless selected), which
+        beats the blockwise kernel's routing and per-block overhead. With ``parts`` > 1
+        only the ``part``-th slice of the local experts is computed (the ranks holding
+        the same experts share the work).
+        """
+        affinities = NF.router(
+            hidden_states=x,
+            router_weights=self.router_weight,
+            top_k=self.top_k,
+            activation="softmax",
+            computation_dtype=torch.float32,
+        )
+        local = affinities[0, self.expert_start : self.expert_start + self.num_local_experts]
+        share = self.num_local_experts // parts
+        experts = slice(part * share, (part + 1) * share)
+        gate_up, down, local = (
+            self.gate_up_weight[experts],
+            self.down_weight[experts],
+            local[experts],
+        )
+        gate = torch.einsum("h,ehi->ei", x[0], gate_up[:, :, 0])
+        up = torch.einsum("h,ehi->ei", x[0], gate_up[:, :, 1])
+        out = torch.einsum("ei,eih->eh", F.silu(gate) * up, down)
+        return (out.float() * local[:, None]).sum(0, keepdim=True).to(x.dtype)
+
+    def shared_expert_part(self, x: torch.Tensor, part: int, parts: int) -> torch.Tensor:
+        """The ``part``-th slice of the (TP-sharded) shared expert's intermediate dim."""
+        share = self.shared_inter // parts
+        cols = slice(part * share, (part + 1) * share)
+        h = F.pad(x, (0, 0, 0, 1))  # the NKI MLP kernel needs an even token count
+        out = NF.mlp(
+            h,
+            self.shared_gate_weight[:, cols],
+            self.shared_up_weight[:, cols],
+            self.shared_down_weight[cols],
+        )
+        return out[:1]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Routed experts: ``x`` ``[T, H]`` (all tokens) -> this rank's partial sum ``[T, H]``."""
         affinities = NF.router(
@@ -742,6 +784,7 @@ class NeuronHunyuanImage3Model(nn.Module):
             if cfg.world_size != 2:
                 raise ValueError("CFG parallelism supports two replicas (cond, uncond)")
             self.cfg_size, self.cfg_rank, self.cfg_group = 2, cfg.rank_in_group, cfg.device_group
+            self.world_group = get_world_group().device_group
 
     @property
     def dtype(self) -> torch.dtype:
@@ -904,7 +947,13 @@ class NeuronHunyuanImage3Model(nn.Module):
         """Final norm and the vocab-sharded LM head: ``h`` ``[1, H]`` -> logits ``[V]`` (fp32)."""
         h = self.ln_f(h)
         local = torch.matmul(h, self.lm_head_weight.t()).float()  # [1, V / TP]
-        return _all_gather(local.t().contiguous(), self.tp_group, self.tp_size).view(-1)
+        logits = _all_gather(local.t().contiguous(), self.tp_group, self.tp_size).view(-1)
+        if self.cfg_size > 1:
+            # The CFG replicas run the same text; averaging their logits makes them
+            # bit-identical on every rank, so they sample the same tokens.
+            logits = _all_reduce(logits, self.world_group, self.cfg_size * self.tp_size)
+            logits = logits / (self.cfg_size * self.tp_size)
+        return logits
 
     def forward_ar_prefill(
         self, embeds, cos, sin, bound_max, t0, latents, vit_tokens, layout, last, cache_len
@@ -919,10 +968,12 @@ class NeuronHunyuanImage3Model(nn.Module):
         h = _all_gather(x, self.tp_group, self.tp_size).index_select(0, last)
         return k, v, self._logits(h)
 
-    def forward_decode(self, embed, cos, sin, k_cache, v_cache, position):
-        """One token: ``embed`` ``[1, H]`` at ``position`` (``[1]`` int64), RoPE ``[1, D]``;
-        returns its logits ``[V]`` and the caches with its K/V written."""
+    def forward_decode(self, embed, cos_table, sin_table, k_cache, v_cache, position):
+        """One token: ``embed`` ``[1, H]`` at ``position`` (``[1]`` int64, device); RoPE from
+        the ``[S, D]`` tables. Returns its logits ``[V]``, the caches with its K/V written
+        and ``position + 1``, so that consecutive steps need only the embedding from the host."""
         x = embed
+        cos, sin = cos_table.index_select(0, position), sin_table.index_select(0, position)
         length = k_cache.shape[2]
         visible = (torch.arange(length, device=x.device) <= position)[None, None, :]
         new_k, new_v = [], []
@@ -939,7 +990,15 @@ class NeuronHunyuanImage3Model(nn.Module):
             out = torch.matmul(out.transpose(0, 1).reshape(1, -1), attn.o_weight)
             x = x + _all_reduce(out, self.tp_group, self.tp_size)
             h = layer.post_attention_layernorm(x)
-            routed = layer.mlp(h)
+            if self.cfg_size > 1 and not layer.mlp.shared_sp:
+                # The CFG replicas hold the same weights: each computes half of the
+                # experts (and of the shared expert), summed over all ranks, so a token
+                # reads half of the expert weights per rank (as TP = 2 x 16 would).
+                part = (self.cfg_rank, self.cfg_size)
+                moe = layer.mlp.decode(h, *part) + layer.mlp.shared_expert_part(h, *part)
+                x = x + _all_reduce(moe, self.world_group, self.cfg_size * self.tp_size)
+                continue
+            routed = layer.mlp.decode(h)
             if layer.mlp.shared_sp:
                 x = x + _all_reduce(routed, self.tp_group, self.tp_size)
                 x = x + layer.mlp.shared_expert(h)
@@ -947,7 +1006,7 @@ class NeuronHunyuanImage3Model(nn.Module):
                 x = x + _all_reduce(
                     routed + layer.mlp.shared_expert(h), self.tp_group, self.tp_size
                 )
-        return self._logits(x), torch.stack(new_k), torch.stack(new_v)
+        return self._logits(x), torch.stack(new_k), torch.stack(new_v), position + 1
 
     def _velocity(self, latents, t, text_k, text_v, cos, sin, bound_min, bound_max):
         """Velocity ``[R, C, h, w]`` of ``latents`` ``[1, C, h, w]`` for each of the ``R`` rows.

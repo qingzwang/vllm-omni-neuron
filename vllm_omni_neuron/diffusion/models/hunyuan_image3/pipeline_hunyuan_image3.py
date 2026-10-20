@@ -406,6 +406,8 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         )
         cache_len = padded + _AR_MAX_NEW_TOKENS + _PREFIX_MULTIPLE
         latents, vit_tokens = encoded
+        # Every rank runs the text graphs (their collectives need all ranks); the logits
+        # are averaged over the CFG replicas in-graph, so all ranks sample the same text.
         k, v, logits = model.ar_prefill(
             embeds,
             cos,
@@ -419,19 +421,23 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             cache_len,
         )
         stops = {t.recaption_end} if bot_task != "think" else {t.think_end, t.recaption_end}
+        cos_table, sin_table = text_rope(cache_len, model.head_dim, model.rope_theta)
+        cos_table, sin_table = cos_table.to(device), sin_table.to(device)
+        position_dev = torch.tensor([length]).to(device)
         generated: list[int] = [trigger]
         forced: list[int] = []
         ratio_index = None
         position = length
         for _ in range(max_new_tokens + 8):
+            host_logits = logits.cpu()
             if forced:
                 token = forced.pop(0)
             elif generated[-1] == t.size and predict_ratio:
-                ratio_logits = logits.cpu()[torch.tensor(t.ratio_ids)]
+                ratio_logits = host_logits[torch.tensor(t.ratio_ids)]
                 ratio_index = int(ratio_logits.argmax())
                 break
             else:
-                token = self._sample(logits.cpu(), generator)
+                token = self._sample(host_logits, generator)
             generated.append(token)
             if token == t.think_end and bot_task == "think_recaption":
                 forced = [t.recaption]
@@ -442,17 +448,11 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
                     break
                 forced = [t.answer, t.boi, t.size]
             embed = model.embed(torch.tensor([[token]]))[0].to(device)
-            rcos, rsin = text_rope(1, model.head_dim, model.rope_theta, start=position)
-            logits, k, v = model.decode(
-                embed,
-                rcos.to(device),
-                rsin.to(device),
-                k,
-                v,
-                torch.tensor([position]).to(device),
+            logits, k, v, position_dev = model.decode(
+                embed, cos_table, sin_table, k, v, position_dev
             )
             position += 1
-        # Every rank (both CFG replicas) continues with rank 0's text.
+        # Every rank continues with rank 0's text (a safeguard; the texts are identical).
         if dist.is_initialized():
             shared = [generated, ratio_index]
             dist.broadcast_object_list(shared, src=0, group=self._world_cpu_group)
