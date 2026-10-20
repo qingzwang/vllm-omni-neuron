@@ -50,6 +50,9 @@ from vllm_omni_neuron.diffusion.distributed.autoencoders.autoencoder_kl_hunyuani
     HunyuanImage3Encoder,
 )
 from vllm_omni_neuron.diffusion.models.hunyuan_image3 import hunyuan_image3_edit as edit
+from vllm_omni_neuron.diffusion.models.hunyuan_image3.hunyuan_image3_expert_load import (
+    INSTRUCT_EXPERT_LOAD,
+)
 from vllm_omni_neuron.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
     Checkpoint,
     NeuronHunyuanImage3Model,
@@ -251,7 +254,10 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         return self
 
     def load_weights(self, weights=None):
-        self.transformer.load_weights(self.model_path)
+        # The Instruct experts are balanced over the ranks by their measured load (the
+        # busiest rank sets each MoE layer's time); the base model keeps the plain order.
+        load = INSTRUCT_EXPERT_LOAD if self.instruct else None
+        self.transformer.load_weights(self.model_path, expert_load=load)
         ckpt = Checkpoint(self.model_path)
         self.vae.load_weights(ckpt)
         if self.instruct:

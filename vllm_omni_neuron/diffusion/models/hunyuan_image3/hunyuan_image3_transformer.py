@@ -76,6 +76,24 @@ _BOUNDS_TILE = 128
 _MOE_BLOCK_SIZE = 512
 
 
+def expert_placement(load, ranks: int) -> list[int]:
+    """The order of a layer's experts such that rank ``r`` holds the ``r``-th slice.
+
+    ``load`` gives each expert's expected share of the routed tokens. Every rank gets
+    the same number of experts and, greedily (heaviest expert first, to the least
+    loaded rank with a free slot), about the same total load: the MoE layers' time is
+    set by the busiest rank, which all others wait for at the next collective.
+    """
+    per_rank = len(load) // ranks
+    slots: list[list[int]] = [[] for _ in range(ranks)]
+    totals = [0.0] * ranks
+    for expert in sorted(range(len(load)), key=lambda e: -load[e]):
+        rank = min((r for r in range(ranks) if len(slots[r]) < per_rank), key=totals.__getitem__)
+        slots[rank].append(expert)
+        totals[rank] += load[expert]
+    return [expert for slot in slots for expert in slot]
+
+
 def _moe_token_count(tokens: int) -> int:
     """Tokens the MoE kernels run on: a multiple of 128 (the kernel's row tile), and
     above 2048 of 2048, so that the blockwise mapping runs as NKI kernels (its
@@ -392,15 +410,21 @@ class HunyuanImage3MoE(nn.Module):
         self.shared_up_weight = nn.Parameter(torch.empty(hidden, self.shared_inter, dtype=dtype))
         self.shared_down_weight = nn.Parameter(torch.empty(self.shared_inter, hidden, dtype=dtype))
 
-    def load(self, ckpt: Checkpoint, prefix: str) -> dict[str, torch.Tensor]:
+    def load(self, ckpt: Checkpoint, prefix: str, order=None) -> dict[str, torch.Tensor]:
         """Local experts and the shared expert.
 
-        The checkpoint's ``gate_and_up_proj`` computes ``x1 * silu(x2)`` for
-        ``x1, x2 = chunk(2)``: its first half is the up projection, the second the gate.
+        ``order`` (see :func:`expert_placement`) permutes the experts: this rank holds
+        ``order[expert_start : expert_start + num_local_experts]`` and the router's
+        columns follow the same order, which leaves the routing unchanged (top-k and
+        softmax do not depend on the experts' order). The checkpoint's
+        ``gate_and_up_proj`` computes ``x1 * silu(x2)`` for ``x1, x2 = chunk(2)``: its
+        first half is the up projection, the second the gate.
         """
         inter = self.intermediate
+        order = list(order) if order is not None else list(range(self.num_experts))
+        local = order[self.expert_start : self.expert_start + self.num_local_experts]
         gate_up, down = [], []
-        for e in range(self.expert_start, self.expert_start + self.num_local_experts):
+        for e in local:
             w = ckpt.get(f"{prefix}experts.{e}.gate_and_up_proj.weight")  # [2I, H]
             gate_up.append(torch.stack([w[inter:].t(), w[:inter].t()], dim=1))  # [H, 2, I]
             down.append(ckpt.get(f"{prefix}experts.{e}.down_proj.weight").t())  # [I, H]
@@ -409,7 +433,7 @@ class HunyuanImage3MoE(nn.Module):
         lo = 0 if self.shared_sp else self.tp_rank * self.shared_inter
         hi = lo + self.shared_inter
         return {
-            "router_weight": ckpt.get(f"{prefix}gate.wg.weight").float().t(),
+            "router_weight": ckpt.get(f"{prefix}gate.wg.weight").float().t()[:, order],
             "gate_up_weight": torch.stack(gate_up),
             "down_weight": torch.stack(down),
             "shared_gate_weight": shared[self.shared_full + lo : self.shared_full + hi].t(),
@@ -796,7 +820,9 @@ class NeuronHunyuanImage3Model(nn.Module):
 
     # -- weights -------------------------------------------------------
 
-    def load_weights(self, model_path: str) -> None:
+    def load_weights(self, model_path: str, expert_load=None) -> None:
+        """Loads this rank's shards; ``expert_load`` (``[layer][expert]`` token shares)
+        balances the experts over the ranks."""
         ckpt = Checkpoint(model_path)
         state: dict[str, torch.Tensor] = {}
         num_kv = self.config.num_key_value_heads
@@ -806,7 +832,12 @@ class NeuronHunyuanImage3Model(nn.Module):
                 state[f"{dst}{name}.weight"] = ckpt.get(f"{src}{name}.weight")
             for k, v in layer.self_attn.load(ckpt, f"{src}self_attn.", num_kv).items():
                 state[f"{dst}self_attn.{k}"] = v
-            for k, v in layer.mlp.load(ckpt, f"{src}mlp.").items():
+            order = None
+            if expert_load is not None:
+                order = expert_placement(
+                    expert_load[i], layer.mlp.num_experts // layer.mlp.num_local_experts
+                )
+            for k, v in layer.mlp.load(ckpt, f"{src}mlp.", order).items():
                 state[f"{dst}mlp.{k}"] = v
         for head in ("patch_embed", "final_layer"):
             for k, v in getattr(self, head).load(ckpt, f"{head}.").items():

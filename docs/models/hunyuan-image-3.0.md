@@ -245,7 +245,8 @@ the text with host-side sampling (one host round trip per token).
 | text-to-image, `think_recaption` (1024x1024) | 11.69 s (812 tokens, 14.4 ms/token) | 18.10 s (851 tokens, 21.3 ms/token) | 0.21 s | 12.50 s | 0.53 s | **24.99 s** |
 | edit (cat), `think_recaption` (832x1216) | 6.13 s (369 tokens, 16.6 ms/token) | 8.46 s (365 tokens, 23.2 ms/token) | 0.47 s | 16.08 s | 0.30 s | **23.58 s** |
 
-Per-token times include the prefill (about 0.3 s, more with a condition image). Plain
+Per-token times include the prefill (about 0.3 s, more with a condition image). The
+denoise times predate the expert placement described below, which takes 3-4% off them. Plain
 TP=32 for the text was slower than TP=16 × CFG=2 with expert splitting (19-20 ms/token
 with host sampling).
 
@@ -276,9 +277,16 @@ How the text decode was sped up (TP=16 × CFG=2, from 37 ms to about 15 ms per t
   tokens sampled past it are dropped. The ratio prediction (4 forced tokens) uses the
   logits graph.
 
-What remains per token is about 14 ms on device, about half of it reading the BF16 expert
-weights. Further gains would need FP8 experts (which would also change the image pass,
-as there is no memory for a second copy) or a fused attention-decode kernel.
+What remains per token is about 14 ms on device. Measured on the 32 NeuronCores by
+recompiling the decode graph without each part: the routed experts take 7.8 ms (reading
+4.8 GB of BF16 weights per rank, about 85% of the HBM bandwidth), attention 3.2 ms, the
+collectives 1.2 ms (66 all-reduces of 8 KB, latency-bound) and the rest (norms, router,
+shared expert, LM head) 1.5 ms. FP8 KV cache or FP8 collectives would save almost nothing
+here (the KV cache is about 80 MB per rank). The attention is latency-bound, about 100 µs
+per layer: the fused `NF.attention_decode` kernel (norm, QKV, RoPE, QK-norm, attention,
+in-kernel KV write and O-projection) measured no faster at one token (3.28 ms vs 3.19 ms
+for 32 layers on one core). FP8 expert weights would halve the 7.8 ms but also change the
+image pass (there is no memory for a second copy).
 
 TP=16 is the smallest layout that fits the weights (about 13 GB per NeuronCore). On 32
 NeuronCores CFG parallelism is faster than TP=32: each replica runs half the tokens, so
@@ -299,6 +307,7 @@ A step at 1024x1024 with CFG runs about 8,200 tokens through the 32 MoE layers (
 | Shared expert sequence-parallel (full weights on each rank's 1/TP of the tokens) instead of an intermediate dim sharded to 192 | an efficient matmul shape and no extra collective, about 0.8 ms per layer |
 | Fused NKI QKV kernel (projection, RoPE and the post-RoPE QK RMSNorm in one kernel, head-major output) | 1.42 ms → 0.82 ms per layer |
 | CFG parallelism (each of two TP=16 groups runs one CFG row) | halves both compute and collective volume per group; on 32 NeuronCores 12.25 s vs 15.06 s for TP=32 |
+| Instruct: experts balanced over the ranks by their measured load | see below; denoising 3-4% faster |
 
 The first four changes took TP=16 from 25.65 s to 21.38 s end to end after the MoE fix
 (the MoE kernel fix came first, before the first full-model run). What remains per layer
@@ -306,6 +315,39 @@ and step at TP=16 is roughly 4 ms of routed experts, 1.4 ms of attention, 0.8 ms
 projection, and about 5 ms of collectives: the all-gather before attention and the
 experts and the reduce-scatter after them each move all 8,200 tokens x 4096 channels,
 about 40% of the step, which is why TP=32 only gains 1.4x over TP=16.
+
+At TP=16 × CFG=2 (Instruct, about 4,100 tokens per replica) a step takes 250 ms. With each
+part removed in turn from the step graph on the 32 NeuronCores: routed experts about
+155 ms, attention about 31 ms, and the collectives 43-66 ms. Without collectives the ranks
+take 161-207 ms: ranks whose experts receive more tokens are slower, and every layer's
+collective waits for the busiest one. Overlapping the collectives with compute (each
+rank's tokens in two chunks, so that one chunk's all-gather or reduce-scatter runs during
+the other's projections and experts) and all-gathering in FP8 (e4m3 with a per-token
+scale; reduce-scatters stay BF16) both measured slower (249-270 ms), as the collectives
+are waits for the busiest rank more than transfers. The MoE kernel itself runs at the
+speed of plain matmuls of the same tokens (single-core benchmark at the per-rank shape),
+and its FP8 compute variants are TRN3-only (on TRN2 FP8 weights are dequantized, which
+would not speed up this compute-bound pass). Block size 512 measured best of 256, 512 and
+1024.
+
+**Expert placement (Instruct).** Routing is uneven: summed over the layers, the busiest
+rank's experts receive 1.3-1.6x the mean token count. The experts are therefore permuted
+per layer so that every rank holds 4 experts of about equal measured load (greedy, the
+heaviest first; the router's columns are permuted the same way, which leaves the routing
+unchanged). The load (`hunyuan_image3_expert_load.py`) was measured over 7 prompts
+(text-to-image and edits, both CFG rows, 50 steps); on prompts left out of the
+measurement the busiest rank's token count drops by 7-19% (13% overall). The kernel works
+in 512-token blocks and every local expert costs at least one, so the busiest rank's
+block count drops less (8% for text-to-image, 13% for edits), and the denoising became
+3-4% faster:
+
+| Request (TP=16 × CFG=2, 50 steps) | Denoise before | Denoise after |
+|---|---|---|
+| text-to-image, `recaption` (1024x1024) | 12.42 s | 12.04 s |
+| text-to-image, `think_recaption` (1024x1024) | 12.50 s | 12.09 s |
+| edit (cat), `think_recaption` (832x1216) | 16.08 s | 15.44 s |
+
+The base model keeps the plain expert order (its load has not been measured).
 
 The VAE was reworked for compile time and memory rather than speed: compiling whole up
 levels on one core (128 channels x 4 frames at 1024x1024) took over 40 minutes per level,
