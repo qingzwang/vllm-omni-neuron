@@ -771,6 +771,10 @@ class NeuronHunyuanImage3Model(nn.Module):
             self.lm_head_weight = nn.Parameter(
                 torch.empty(config.vocab_size // self.tp_size, config.hidden_size, dtype=dtype)
             )
+            # The vocab shard of the token embedding, for decoding without the host.
+            self.wte_local = nn.Parameter(
+                torch.empty(config.vocab_size // self.tp_size, config.hidden_size, dtype=dtype)
+            )
         self._compiled_prefix = None
         self._compiled_step = None
         # CFG parallelism: replicas (one TP group each) run the conditional and the
@@ -815,6 +819,9 @@ class NeuronHunyuanImage3Model(nn.Module):
             rows = self.lm_head_weight.shape[0]
             state["lm_head_weight"] = ckpt.rows(
                 "lm_head.weight", self.tp_rank * rows, (self.tp_rank + 1) * rows
+            )
+            state["wte_local"] = ckpt.rows(
+                "model.wte.weight", self.tp_rank * rows, (self.tp_rank + 1) * rows
             )
         state = {
             k: v.to(torch.float32 if k.endswith("router_weight") else self._dtype).contiguous()
@@ -972,6 +979,56 @@ class NeuronHunyuanImage3Model(nn.Module):
         """One token: ``embed`` ``[1, H]`` at ``position`` (``[1]`` int64, device); RoPE from
         the ``[S, D]`` tables. Returns its logits ``[V]``, the caches with its K/V written
         and ``position + 1``, so that consecutive steps need only the embedding from the host."""
+        x, new_k, new_v = self._decode_layers(
+            embed, cos_table, sin_table, k_cache, v_cache, position
+        )
+        return self._logits(x), new_k, new_v, position + 1
+
+    def forward_decode_sample(
+        self, token, position, step, k_cache, v_cache, cos_table, sin_table, tokens, ranks, sampling
+    ):
+        """One token fully on device: embed ``token`` (``[1]`` int32), run the layers and
+        sample the next token (``NF.sample``: top-k from the vocab shards, temperature,
+        top-p). ``sampling`` = (temperature, top_k, top_p, forced_after, forced) is
+        static; when ``token`` is ``forced_after`` the next token is ``forced``. ``ranks``
+        = (TP rank int32, 1.0 on global rank 0 else 0.0) as tensors, so that every rank
+        compiles the same graph. The next token is written to ``tokens`` at ``step``; all
+        outputs feed the next call, so steps queue up without a host round trip."""
+        temperature, top_k, top_p, forced_after, forced = sampling
+        rank, lead = ranks
+        embed = self._embed_tokens_device(token, rank)
+        x, new_k, new_v = self._decode_layers(
+            embed, cos_table, sin_table, k_cache, v_cache, position
+        )
+        local = torch.matmul(self.ln_f(x), self.lm_head_weight.t()).float()  # [1, V / TP]
+        nxt = NF.sample(
+            local,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            tp_group=self.tp_group,
+            max_top_k=top_k,
+            tp_rank=rank,
+        ).view(1)
+        # Every rank continues with global rank 0's token (each rank draws its own random
+        # number). Token ids are exact in float32.
+        group = self.world_group if self.cfg_size > 1 else self.tp_group
+        own = _all_reduce(nxt.float() * lead, group, self.cfg_size * self.tp_size)
+        nxt = own.round().to(nxt.dtype)
+        if forced_after >= 0:
+            nxt = torch.where(token == forced_after, torch.full_like(nxt, forced), nxt)
+        tokens = tokens.index_copy(0, step, nxt)
+        return nxt, position + 1, step + 1, new_k, new_v, tokens
+
+    def _embed_tokens_device(self, token: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+        """Token embedding from the vocab-sharded device table: ``[1]`` -> ``[1, H]``."""
+        rows = self.wte_local.shape[0]
+        local = token.long() - rank.long() * rows
+        inside = (local >= 0) & (local < rows)
+        embed = self.wte_local.index_select(0, local.clamp(0, rows - 1)) * inside[:, None]
+        return _all_reduce(embed, self.tp_group, self.tp_size)
+
+    def _decode_layers(self, embed, cos_table, sin_table, k_cache, v_cache, position):
         x = embed
         cos, sin = cos_table.index_select(0, position), sin_table.index_select(0, position)
         length = k_cache.shape[2]
@@ -1006,7 +1063,7 @@ class NeuronHunyuanImage3Model(nn.Module):
                 x = x + _all_reduce(
                     routed + layer.mlp.shared_expert(h), self.tp_group, self.tp_size
                 )
-        return self._logits(x), torch.stack(new_k), torch.stack(new_v), position + 1
+        return x, torch.stack(new_k), torch.stack(new_v)
 
     def _velocity(self, latents, t, text_k, text_v, cos, sin, bound_min, bound_max):
         """Velocity ``[R, C, h, w]`` of ``latents`` ``[1, C, h, w]`` for each of the ``R`` rows.
@@ -1100,6 +1157,12 @@ class NeuronHunyuanImage3Model(nn.Module):
                 options={**ar_options, "model_name": f"{name}_decode"},
                 **kwargs,
             )
+            self._compiled_decode_sample = torch.compile(
+                self.forward_decode_sample,
+                *args,
+                options={**ar_options, "model_name": f"{name}_decode_sample"},
+                **kwargs,
+            )
         self._compiled_step = torch.compile(
             self.forward_step, *args, options=step_options, **kwargs
         )
@@ -1110,6 +1173,10 @@ class NeuronHunyuanImage3Model(nn.Module):
 
     def ar_prefill(self, *args):
         fn = getattr(self, "_compiled_ar_prefill", None) or self.forward_ar_prefill
+        return fn(*args)
+
+    def decode_sample(self, *args):
+        fn = getattr(self, "_compiled_decode_sample", None) or self.forward_decode_sample
         return fn(*args)
 
     def decode(self, *args):

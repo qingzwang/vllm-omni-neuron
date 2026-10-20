@@ -133,15 +133,17 @@ multiple of 1024 tokens.
 text, as the official `generate_image`: the reply starts with `<think>` (`think`,
 `think_recaption`) or `<recaption>` (`recaption`); in `think_recaption` the model's
 `</think>` is followed by `<recaption>`, and the text ends at `</recaption>` (at most 2048
-tokens), sampled with the checkpoint's temperature 0.6, top-k 1024 and top-p 0.95 (seeded
-by the request's seed). Without an explicit size, `<answer> <boi> <img_size_1024>` follow
+tokens), sampled with the checkpoint's temperature 0.6 and top-p 0.95 (top-k 256 instead
+of the checkpoint's 1024: at this temperature and top-p the nucleus is well inside the top
+256; the first token is seeded by the request's seed, the rest use the device RNG). Without an explicit size, `<answer> <boi> <img_size_1024>` follow
 and the most likely ratio token picks the output bucket. The image pass then uses the
 sequence with the text after `"Assistant: "` (its unconditional row keeps the tags and
 replaces the text with `<cfg>`). Two more graphs run the text: a prefill (the edit prefix
 graph plus the final norm and the vocab-sharded LM head, filling a static KV cache of the
 prefix + 2048 + 1024 positions) and a one-token decode step (attention over the cache,
-the MoE layers at one token, and the LM head); the logits are sampled on the host. With
-CFG parallelism the decode uses all 32 NeuronCores (see Performance).
+the MoE layers at one token, the LM head and on-device sampling), queued without a host
+round trip per token. With CFG parallelism the decode uses all 32 NeuronCores (see
+Performance).
 
 ## Running
 
@@ -233,23 +235,25 @@ per condition image).
 
 **Think / recaption** (Instruct, 50 steps, guidance 2.5, seed 42, the output size predicted
 by the model). "Text" is the prefill and the token-by-token decode of the think / recaption
-text; "prefix" the image pass's prefix graph. With TP=16 × CFG=2 the text runs on all 32
-NeuronCores (the two replicas split the experts, see below) and the image on TP=16 × CFG=2;
-plain TP=32 is shown for comparison.
+text; "prefix" the image pass's prefix graph. The text runs on all 32 NeuronCores (the two
+CFG replicas split the experts, see below) and the image on TP=16 × CFG=2. "Before" is
+the text with host-side sampling (one host round trip per token).
 
-| Request | Layout | Text | Prefix | Denoise | VAE decode | End-to-end |
+| Request | Text | Text before | Prefix | Denoise | VAE decode | End-to-end |
 |---|---|---|---|---|---|---|
-| text-to-image, `recaption` (1024x1024) | TP=16 × CFG=2 | 7.10 s (327 tokens, 21.7 ms/token) | 0.14 s | 12.42 s | 0.53 s | **20.23 s** |
-| | TP=32 | 6.83 s (343 tokens, 19.9 ms/token) | 0.21 s | 16.66 s | 0.53 s | 24.27 s |
-| text-to-image, `think_recaption` (1024x1024) | TP=16 × CFG=2 | 18.10 s (851 tokens, 21.3 ms/token) | 0.21 s | 12.49 s | 0.53 s | **31.37 s** |
-| | TP=32 | 16.14 s (834 tokens, 19.3 ms/token) | 0.29 s | 16.87 s | 0.53 s | 33.87 s |
-| edit (cat), `think_recaption` (832x1216) | TP=16 × CFG=2 | 8.46 s (365 tokens, 23.2 ms/token) | 0.46 s | 16.03 s | 0.31 s | **25.85 s** |
+| text-to-image, `recaption` (1024x1024) | 4.27 s (277 tokens, 15.4 ms/token) | 7.10 s (327 tokens, 21.7 ms/token) | 0.14 s | 12.42 s | 0.53 s | **17.41 s** |
+| text-to-image, `think_recaption` (1024x1024) | 11.69 s (812 tokens, 14.4 ms/token) | 18.10 s (851 tokens, 21.3 ms/token) | 0.21 s | 12.50 s | 0.53 s | **24.99 s** |
+| edit (cat), `think_recaption` (832x1216) | 6.13 s (369 tokens, 16.6 ms/token) | 8.46 s (365 tokens, 23.2 ms/token) | 0.47 s | 16.08 s | 0.30 s | **23.58 s** |
 
-The edit also spends 0.50 s encoding the condition image. The texts differ slightly between
-layouts (sampling is seeded, but the BF16 logits are not bit-identical across layouts);
-the text length, set by the model, decides how much the text adds.
+Per-token times include the prefill (about 0.3 s, more with a condition image). Plain
+TP=32 for the text was slower than TP=16 × CFG=2 with expert splitting (19-20 ms/token
+with host sampling).
 
-How the text decode was sped up (TP=16 × CFG=2, from 37 ms to about 21 ms per token):
+The edit also spends 0.49 s encoding the condition image. The texts differ between runs
+of different builds (the device RNG draws the tokens after the first); the text length,
+set by the model, decides how much the text adds.
+
+How the text decode was sped up (TP=16 × CFG=2, from 37 ms to about 15 ms per token):
 
 - **Dense experts at one token.** The blockwise MoE kernel computes a whole 512-token block
   per selected expert; at one token every local expert is instead computed densely and
@@ -261,10 +265,20 @@ How the text decode was sped up (TP=16 × CFG=2, from 37 ms to about 21 ms per t
   halving the expert weights each rank reads per token (as TP=32 would). The logits are
   averaged over the replicas in-graph, so every rank samples the same token.
 - **Fewer host transfers.** The RoPE tables are on device and indexed by a device-side
-  position counter; each step sends only the token's embedding.
+  position counter.
+- **On-device sampling, no per-token host round trip** (about 21 to 15 ms per token). The
+  decode graph looks the token up in a vocab-sharded embedding table, samples the next
+  token from the vocab-sharded logits (`NF.sample`: distributed top-k, temperature,
+  top-p), takes global rank 0's token on every rank (one all-reduce), applies the forced
+  `</think>` -> `<recaption>` and writes the token to a device buffer. Its outputs are the
+  next call's inputs, so the host queues the steps (at most 4 in flight, as Lite's
+  execution queue is short) and reads the buffer every 16 tokens to find the stop tag;
+  tokens sampled past it are dropped. The ratio prediction (4 forced tokens) uses the
+  logits graph.
 
-What remains per token is about 14 ms on device (half of it the expert weights) and about
-6 ms of host-side graph dispatch and sampling.
+What remains per token is about 14 ms on device, about half of it reading the BF16 expert
+weights. Further gains would need FP8 experts (which would also change the image pass,
+as there is no memory for a second copy) or a fused attention-decode kernel.
 
 TP=16 is the smallest layout that fits the weights (about 13 GB per NeuronCore). On 32
 NeuronCores CFG parallelism is faster than TP=32: each replica runs half the tokens, so
@@ -404,9 +418,9 @@ logo of image 1 becomes an enamel fridge magnet in the material of image 2 (16.5
 ## Known limitations
 
 - **Think / recaption text is sampled, not matched to the reference token for token**: it
-  uses the request's seed (the official code samples from an unseeded global RNG), the
-  condition latents are shared with the image pass, and the text differs slightly between
-  parallel layouts (BF16 logits). `drop_think` and the automatic aspect
+  is sampled on device (top-k 256 instead of 1024; only the first token uses the
+  request's seed, so the text may differ run to run; the official code samples
+  from an unseeded global RNG), and the condition latents are shared with the image pass. `drop_think` and the automatic aspect
   ratio of direct generation (`bot_task="image"` without a size, a separate one-token
   pass officially) are not implemented: direct generation takes the first condition
   image's bucket, or the given size.

@@ -85,6 +85,12 @@ _DEFAULT_MAX_TEXT_TOKENS = 1024
 _PREFIX_MULTIPLE = 1024
 # Think / recaption: the official limit of generated text tokens.
 _AR_MAX_NEW_TOKENS = 2048
+# On-device text sampling: decode steps queued per host sync, and the top-k candidates
+# (the checkpoint's top_k is 1024; at temperature 0.6 / top_p 0.95 the nucleus is far
+# inside the top 256).
+_DECODE_CHUNK = 16
+_DECODE_IN_FLIGHT = 4
+_DEVICE_TOP_K = 256
 _BOT_TASKS = ("image", "recaption", "think", "think_recaption")
 
 _COMPILER_ARGS = ["--model-type=transformer", "--auto-cast=none", "-O1"]
@@ -423,35 +429,57 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         stops = {t.recaption_end} if bot_task != "think" else {t.think_end, t.recaption_end}
         cos_table, sin_table = text_rope(cache_len, model.head_dim, model.rope_theta)
         cos_table, sin_table = cos_table.to(device), sin_table.to(device)
-        position_dev = torch.tensor([length]).to(device)
-        generated: list[int] = [trigger]
-        forced: list[int] = []
-        ratio_index = None
-        position = length
-        for _ in range(max_new_tokens + 8):
-            host_logits = logits.cpu()
-            if forced:
-                token = forced.pop(0)
-            elif generated[-1] == t.size and predict_ratio:
-                ratio_logits = host_logits[torch.tensor(t.ratio_ids)]
-                ratio_index = int(ratio_logits.argmax())
-                break
-            else:
-                token = self._sample(host_logits, generator)
-            generated.append(token)
-            if token == t.think_end and bot_task == "think_recaption":
-                forced = [t.recaption]
-            elif token in stops or len(generated) > max_new_tokens:
-                if token not in stops:  # out of budget: close the open section
-                    generated.append(t.recaption_end if trigger == t.recaption else t.think_end)
-                if not predict_ratio:
+        # The first token is sampled from the prefill logits on the host (every rank
+        # takes rank 0's); the rest are sampled on device, _DECODE_CHUNK steps queued at
+        # a time, until a stop tag or the budget.
+        first = [self._sample(logits.cpu(), generator)]
+        if dist.is_initialized():
+            dist.broadcast_object_list(first, src=0, group=self._world_cpu_group)
+        generated: list[int] = [trigger, first[0]]
+        forced_after = t.think_end if bot_task == "think_recaption" else -1
+        sampling = (self.temperature, _DEVICE_TOP_K, self.top_p, forced_after, t.recaption)
+        lead = float(not dist.is_initialized() or dist.get_rank() == 0)
+        ranks = (
+            torch.tensor(model.tp_rank, dtype=torch.int32).to(device),
+            torch.tensor(lead).to(device),
+        )
+        steps = max_new_tokens + _DECODE_CHUNK
+        tokens = torch.zeros(steps, dtype=torch.int32).to(device)
+        token = torch.tensor(first, dtype=torch.int32).to(device)
+        position, step = torch.tensor([length]).to(device), torch.tensor([0]).to(device)
+        done, submitted, in_flight = generated[-1] in stops, 0, []
+        while not done and len(generated) <= max_new_tokens:
+            for _ in range(min(_DECODE_CHUNK, steps - submitted)):
+                token, position, step, k, v, tokens = model.decode_sample(
+                    token, position, step, k, v, cos_table, sin_table, tokens, ranks, sampling
+                )
+                # At most _DECODE_IN_FLIGHT steps queued (Lite's execution queue is short).
+                in_flight.append(token)
+                if len(in_flight) > _DECODE_IN_FLIGHT:
+                    _wait_for(in_flight.pop(0))
+            new = tokens[submitted : submitted + _DECODE_CHUNK].cpu().tolist()
+            submitted += _DECODE_CHUNK
+            for value in new:
+                generated.append(value)
+                if value in stops or len(generated) > max_new_tokens:
+                    done = True
                     break
-                forced = [t.answer, t.boi, t.size]
-            embed = model.embed(torch.tensor([[token]]))[0].to(device)
-            logits, k, v, position_dev = model.decode(
-                embed, cos_table, sin_table, k, v, position_dev
-            )
-            position += 1
+        if generated[-1] not in stops:  # out of budget: close the open section
+            close = t.recaption_end if t.recaption in generated else t.think_end
+            generated.append(close)
+        position = length + len(generated) - 2  # where the closing tag is decoded
+        ratio_index = None
+        if predict_ratio:
+            # <close tag> <answer> <boi> <img_size_1024>, then the most likely ratio token.
+            # The positions after the closing tag may hold the KV of tokens sampled past
+            # it; they are overwritten or masked.
+            position_dev = torch.tensor([position]).to(device)
+            for token_id in (generated[-1], t.answer, t.boi, t.size):
+                embed = model.embed(torch.tensor([[token_id]]))[0].to(device)
+                logits, k, v, position_dev = model.decode(
+                    embed, cos_table, sin_table, k, v, position_dev
+                )
+            ratio_index = int(logits.cpu()[torch.tensor(t.ratio_ids)].argmax())
         # Every rank continues with rank 0's text (a safeguard; the texts are identical).
         if dist.is_initialized():
             shared = [generated, ratio_index]
@@ -467,7 +495,7 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
                 opening = None
             elif opening is not None:
                 current.append(token)
-        return sections, ratio_index, position - length
+        return sections, ratio_index, len(generated) - 1
 
     def forward(self, req) -> DiffusionOutput:
         if req.request_ids == ["dummy_req_id"] and self._prompt_of(req.prompts[0]) == "dummy run":
