@@ -169,6 +169,12 @@ def _all_gather(x: torch.Tensor, group, size: int) -> torch.Tensor:
     return out
 
 
+def _all_reduce(x: torch.Tensor, group, size: int) -> torch.Tensor:
+    if size > 1:
+        dist.all_reduce(x, op=dist.ReduceOp.SUM, group=group)
+    return x
+
+
 def _reduce_scatter(x: torch.Tensor, group, size: int) -> torch.Tensor:
     if size == 1:
         return x
@@ -261,7 +267,7 @@ class HunyuanImage3Attention(nn.Module):
             "key_layernorm.weight": ckpt.get(f"{prefix}key_layernorm.weight"),
         }
 
-    def project(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    def project(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, fused: bool = True):
         """``x`` ``[T, H]`` -> ``q`` ``[heads, T, D]``, ``k``/``v`` ``[kv_heads, T, D]``.
 
         As the reference: RoPE in float32, then the per-head RMS QK-norm, then a cast to
@@ -269,7 +275,7 @@ class HunyuanImage3Attention(nn.Module):
         and the (post-RoPE) norm and writes the head-major layout attention consumes.
         """
         tokens = x.shape[0]
-        if x.device.type != "cpu":
+        if fused and x.device.type != "cpu":
             qkv = NF.qkv_proj(
                 x[None],
                 self.qkv_weight,
@@ -688,6 +694,7 @@ class NeuronHunyuanImage3Model(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         num_layers: int | None = None,
         shared_sequence_parallel: bool = True,
+        with_lm_head: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -713,6 +720,15 @@ class NeuronHunyuanImage3Model(nn.Module):
         self.time_embed = TimestepEmbedder(config.hidden_size, dtype)
         self.time_embed_2 = TimestepEmbedder(config.hidden_size, dtype)
         self._embed_tokens: torch.Tensor | None = None
+        # The LM head for autoregressive text (think / recaption), vocab-sharded.
+        self.with_lm_head = with_lm_head
+        if with_lm_head:
+            if config.vocab_size % self.tp_size:
+                raise ValueError(f"the vocabulary does not shard over TP={self.tp_size}")
+            self.ln_f = HunyuanRMSNorm(config.hidden_size, config.rms_norm_eps, dtype)
+            self.lm_head_weight = nn.Parameter(
+                torch.empty(config.vocab_size // self.tp_size, config.hidden_size, dtype=dtype)
+            )
         self._compiled_prefix = None
         self._compiled_step = None
         # CFG parallelism: replicas (one TP group each) run the conditional and the
@@ -751,6 +767,12 @@ class NeuronHunyuanImage3Model(nn.Module):
         for name, _ in self.named_parameters():
             if name.startswith("time"):
                 state[name] = ckpt.get(name)
+        if self.with_lm_head:
+            state["ln_f.weight"] = ckpt.get("model.ln_f.weight")
+            rows = self.lm_head_weight.shape[0]
+            state["lm_head_weight"] = ckpt.rows(
+                "lm_head.weight", self.tp_rank * rows, (self.tp_rank + 1) * rows
+            )
         state = {
             k: v.to(torch.float32 if k.endswith("router_weight") else self._dtype).contiguous()
             for k, v in state.items()
@@ -806,7 +828,14 @@ class NeuronHunyuanImage3Model(nn.Module):
         ``bound_max`` ``[P_pad, 1]`` gives each query's key range (causal, full within a
         condition image's joint span).
         """
-        rows, length, hidden = embeds.shape
+        x = self._edit_embeddings(embeds, t0, latents, vit_tokens, layout)
+        rows, length, _ = embeds.shape
+        return self._prefix_layers(x, rows, length, cos, sin, bound_max)
+
+    def _edit_embeddings(self, embeds, t0, latents, vit_tokens, layout):
+        """The SP-sharded prefix embeddings: text, with the condition images' slots
+        filled (see :meth:`forward_prefix_edit`)."""
+        rows = embeds.shape[0]
         t0 = t0.expand(1)
         temb = self.time_embed(t0)
         timestep = self.timestep_emb(t0)  # [1, H]
@@ -832,14 +861,14 @@ class NeuronHunyuanImage3Model(nn.Module):
                 if lead:
                     row = row.index_copy(0, torch.cat(lead_index), torch.cat(lead_values))
             out_rows.append(row)
-        x = torch.cat(out_rows)
-        x = _reduce_scatter(x, self.tp_group, self.tp_size)
-        return self._prefix_layers(x, rows, length, cos, sin, bound_max)
+        return _reduce_scatter(torch.cat(out_rows), self.tp_group, self.tp_size)
 
-    def _prefix_layers(self, x, rows, length, cos, sin, bound_max=None):
+    def _prefix_layers(self, x, rows, length, cos, sin, bound_max=None, keep_output=False):
         """Every layer's K/V ``[layers, R, kv_heads, P, D]`` of the SP-sharded prefix ``x``.
 
         Causal attention, or with ``bound_max`` each query's keys ``[0, bound_max)``.
+        With ``keep_output`` the last layer runs too and its (SP-sharded) output is
+        also returned.
         """
         cos, sin = cos.repeat(rows, 1), sin.repeat(rows, 1)
         if bound_max is not None:
@@ -851,7 +880,7 @@ class NeuronHunyuanImage3Model(nn.Module):
             q, k, v = attn.project(h, cos, sin)
             keys.append(k.view(attn.num_kv_heads, rows, length, -1).transpose(0, 1))
             values.append(v.view(attn.num_kv_heads, rows, length, -1).transpose(0, 1))
-            if i == len(self.layers) - 1:
+            if i == len(self.layers) - 1 and not keep_output:
                 break  # the last layer's output is not needed
             out = []
             for r in range(rows):
@@ -865,7 +894,60 @@ class NeuronHunyuanImage3Model(nn.Module):
             out = torch.cat(out)
             x = x + _reduce_scatter(torch.matmul(out, attn.o_weight), self.tp_group, self.tp_size)
             x = self._mlp(layer, x)
+        if keep_output:
+            return torch.stack(keys), torch.stack(values), x
         return torch.stack(keys), torch.stack(values)
+
+    # -- autoregressive text (think / recaption) -------------------------
+
+    def _logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Final norm and the vocab-sharded LM head: ``h`` ``[1, H]`` -> logits ``[V]`` (fp32)."""
+        h = self.ln_f(h)
+        local = torch.matmul(h, self.lm_head_weight.t()).float()  # [1, V / TP]
+        return _all_gather(local.t().contiguous(), self.tp_group, self.tp_size).view(-1)
+
+    def forward_ar_prefill(
+        self, embeds, cos, sin, bound_max, t0, latents, vit_tokens, layout, last, cache_len
+    ):
+        """One row's prefix K/V padded to ``cache_len`` (``[layers, kv_heads, S, D]``) and
+        the logits of the token at ``last`` (``[1]`` int64)."""
+        x = self._edit_embeddings(embeds, t0, latents, vit_tokens, layout)
+        length = embeds.shape[1]
+        k, v, x = self._prefix_layers(x, 1, length, cos, sin, bound_max, keep_output=True)
+        pad = (0, 0, 0, cache_len - length)
+        k, v = F.pad(k[:, 0], pad), F.pad(v[:, 0], pad)
+        h = _all_gather(x, self.tp_group, self.tp_size).index_select(0, last)
+        return k, v, self._logits(h)
+
+    def forward_decode(self, embed, cos, sin, k_cache, v_cache, position):
+        """One token: ``embed`` ``[1, H]`` at ``position`` (``[1]`` int64), RoPE ``[1, D]``;
+        returns its logits ``[V]`` and the caches with its K/V written."""
+        x = embed
+        length = k_cache.shape[2]
+        visible = (torch.arange(length, device=x.device) <= position)[None, None, :]
+        new_k, new_v = [], []
+        for i, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            q, k, v = attn.project(layer.input_layernorm(x), cos, sin, fused=False)
+            keys = k_cache[i].index_copy(1, position, k)
+            vals = v_cache[i].index_copy(1, position, v)
+            new_k.append(keys)
+            new_v.append(vals)
+            scores = torch.matmul(q, attn.expand_kv(keys).transpose(1, 2)).float() * attn.scale
+            probs = scores.masked_fill(~visible, float("-inf")).softmax(dim=-1)
+            out = torch.matmul(probs.to(x.dtype), attn.expand_kv(vals))  # [heads, 1, D]
+            out = torch.matmul(out.transpose(0, 1).reshape(1, -1), attn.o_weight)
+            x = x + _all_reduce(out, self.tp_group, self.tp_size)
+            h = layer.post_attention_layernorm(x)
+            routed = layer.mlp(h)
+            if layer.mlp.shared_sp:
+                x = x + _all_reduce(routed, self.tp_group, self.tp_size)
+                x = x + layer.mlp.shared_expert(h)
+            else:
+                x = x + _all_reduce(
+                    routed + layer.mlp.shared_expert(h), self.tp_group, self.tp_size
+                )
+        return self._logits(x), torch.stack(new_k), torch.stack(new_v)
 
     def _velocity(self, latents, t, text_k, text_v, cos, sin, bound_min, bound_max):
         """Velocity ``[R, C, h, w]`` of ``latents`` ``[1, C, h, w]`` for each of the ``R`` rows.
@@ -944,12 +1026,35 @@ class NeuronHunyuanImage3Model(nn.Module):
         self._compiled_prefix_edit = torch.compile(
             self.forward_prefix_edit, *args, options=edit_options, **kwargs
         )
+        if self.with_lm_head:
+            ar_options = {**(prefix_options or {})}
+            name = ar_options.get("model_name", "prefix")
+            self._compiled_ar_prefill = torch.compile(
+                self.forward_ar_prefill,
+                *args,
+                options={**ar_options, "model_name": f"{name}_ar"},
+                **kwargs,
+            )
+            self._compiled_decode = torch.compile(
+                self.forward_decode,
+                *args,
+                options={**ar_options, "model_name": f"{name}_decode"},
+                **kwargs,
+            )
         self._compiled_step = torch.compile(
             self.forward_step, *args, options=step_options, **kwargs
         )
 
     def prefix(self, *args):
         fn = self._compiled_prefix if self._compiled_prefix is not None else self.forward_prefix
+        return fn(*args)
+
+    def ar_prefill(self, *args):
+        fn = getattr(self, "_compiled_ar_prefill", None) or self.forward_ar_prefill
+        return fn(*args)
+
+    def decode(self, *args):
+        fn = getattr(self, "_compiled_decode", None) or self.forward_decode
         return fn(*args)
 
     def prefix_edit(self, *args):

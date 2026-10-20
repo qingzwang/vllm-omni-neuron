@@ -83,6 +83,9 @@ _DEFAULT_MAX_TEXT_TOKENS = 1024
 # Instruct prefixes (system prompt, condition images) are padded to a multiple of this,
 # so a new prefix graph compiles only when the padded length changes.
 _PREFIX_MULTIPLE = 1024
+# Think / recaption: the official limit of generated text tokens.
+_AR_MAX_NEW_TOKENS = 2048
+_BOT_TASKS = ("image", "recaption", "think", "think_recaption")
 
 _COMPILER_ARGS = ["--model-type=transformer", "--auto-cast=none", "-O1"]
 _VAE_COMPILER_ARGS = [
@@ -194,6 +197,10 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         gen = json.load(open(gen_path)) if os.path.exists(gen_path) else {}
         self.default_steps = int(gen.get("diff_infer_steps", _DEFAULT_STEPS))
         self.default_guidance = float(gen.get("diff_guidance_scale", _DEFAULT_GUIDANCE))
+        # Sampling of the think / recaption text (the checkpoint's generation config).
+        self.temperature = float(gen.get("temperature", 0.6))
+        self.top_k = int(gen.get("top_k", 1024))
+        self.top_p = float(gen.get("top_p", 0.95))
         # The Instruct checkpoint: instruct template, system prompt, condition images.
         self.instruct = gen.get("sequence_template") == "instruct"
         if self.instruct:
@@ -206,13 +213,18 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         # Instruct also holds the vision tower, the VAE encoder and the larger edit
         # graphs: shard its shared expert over TP to keep memory headroom.
         self.transformer = NeuronHunyuanImage3Model(
-            config, dtype=dtype, num_layers=num_layers, shared_sequence_parallel=not self.instruct
+            config,
+            dtype=dtype,
+            num_layers=num_layers,
+            shared_sequence_parallel=not self.instruct,
+            with_lm_head=self.instruct,
         )
         self.latent_channels = self.transformer.latent_channels
         self.is_output_rank = not dist.is_initialized() or dist.get_rank() == 0
         # Every rank decodes a row strip of the image.
         self.vae = HunyuanImage3Decoder(config.vae, dtype=dtype)
         world = get_world_group()
+        self._world_cpu_group = world.cpu_group
         self.vae.set_parallel(world.device_group, world.world_size, world.rank_in_group)
         self.vision = self.vae_encoder = None
         if self.instruct:
@@ -311,21 +323,10 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             return ids
         return ids[model.cfg_rank : model.cfg_rank + 1] if cfg else ids[:1]
 
-    def _prefix_instruct(self, prompt, conditions, ratio_index, cfg, generator):
-        """Instruct prefix K/V: system prompt, condition images, instruction."""
-        model, device = self.transformer, self.device
-        prefix = edit.edit_prefix(
-            self.tokens, self.system_prompt, prompt, conditions, ratio_index, cfg
-        )
-        length = prefix.ids.shape[1]
-        padded = -(-length // _PREFIX_MULTIPLE) * _PREFIX_MULTIPLE
-        ids = torch.full((prefix.ids.shape[0], padded), self.pad_id, dtype=torch.long)
-        ids[:, :length] = prefix.ids
-        ids = self._own_rows(ids, cfg)
-        cos, sin = edit.prefix_rope(prefix, conditions, model.head_dim, model.rope_theta, padded)
-        bound_max = edit.prefix_bounds(prefix, padded)
-        # Condition images: VAE latents (the official sampling noise is drawn first,
-        # image by image, from the request's generator) and SigLIP2 tokens.
+    def _encode_conditions(self, conditions, generator):
+        """Condition images: VAE latents (the official sampling noise is drawn first,
+        image by image, from the request's generator) and SigLIP2 tokens."""
+        device = self.device
         latents, vit_tokens = [], []
         for cond in conditions:
             h, w = cond.latent_hw
@@ -333,18 +334,140 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             latents.append(self.vae_encoder.encode(cond.vae_pixels.to(device), eps.to(device)))
             vit_tokens.append(self.vision(cond.vit_pixels, cond.vit_hw, device))
             _wait_for(vit_tokens[-1])
+        return latents, vit_tokens
+
+    def _edit_inputs(self, prefix, conditions, rows: torch.Tensor):
+        """Device inputs of the prefix graphs for ``rows`` padded to a multiple of 1024."""
+        model, device = self.transformer, self.device
+        length = prefix.ids.shape[1]
+        padded = -(-length // _PREFIX_MULTIPLE) * _PREFIX_MULTIPLE
+        ids = torch.full((rows.shape[0], padded), self.pad_id, dtype=torch.long)
+        ids[:, :length] = rows
+        cos, sin = edit.prefix_rope(prefix, conditions, model.head_dim, model.rope_theta, padded)
+        bound_max = edit.prefix_bounds(prefix, padded)
         layout = tuple(zip(prefix.timestep_pos, prefix.vae_pos, prefix.vit_pos))
-        text_k, text_v = model.prefix_edit(
+        return (
             model.embed(ids).to(device),
             cos.to(device),
             sin.to(device),
             bound_max.to(device),
             torch.zeros(1).to(device),
+            layout,
+            padded,
+        )
+
+    def _prefix_instruct(self, prompt, conditions, encoded, ratio_index, cfg, cot=None):
+        """Instruct prefix K/V: system prompt, condition images, instruction (and the
+        think / recaption text)."""
+        model = self.transformer
+        prefix = edit.edit_prefix(
+            self.tokens, self.system_prompt, prompt, conditions, ratio_index, cfg, cot=cot
+        )
+        rows = self._own_rows(prefix.ids, cfg)
+        embeds, cos, sin, bound_max, t0, layout, _ = self._edit_inputs(prefix, conditions, rows)
+        latents, vit_tokens = encoded
+        text_k, text_v = model.prefix_edit(
+            embeds, cos, sin, bound_max, t0, latents, vit_tokens, layout
+        )
+        return text_k, text_v, prefix.ids.shape[1], rows.shape[0]
+
+    def _sample(self, logits: torch.Tensor, generator) -> int:
+        """Temperature, top-k, then top-p sampling (as the official ``generate``)."""
+        logits = logits.float() / self.temperature
+        values, index = torch.topk(logits, min(self.top_k, logits.numel()))
+        probs = values.softmax(dim=-1)
+        # Keep the smallest prefix of the sorted tokens whose probability reaches top_p.
+        keep = (probs.cumsum(dim=-1) - probs) < self.top_p
+        probs = torch.where(keep, probs, torch.zeros_like(probs))
+        choice = torch.multinomial(probs / probs.sum(), 1, generator=generator)
+        return int(index[choice])
+
+    def _generate_text(
+        self, prompt, conditions, encoded, bot_task, predict_ratio, generator, max_new_tokens
+    ):
+        """Think / recaption text, and with ``predict_ratio`` the output's ratio bucket.
+
+        As the official ``generate_image``: the reply starts with ``<think>`` (think
+        modes) or ``<recaption>``; in think_recaption ``</think>`` is followed by
+        ``<recaption>``; the text ends at ``</recaption>`` (or ``</think>`` for think).
+        To predict the size, ``<answer> <boi> <img_size_1024>`` follow and the ratio
+        token is the most likely of the ratio tokens. Returns the sections
+        ``[(open tag, text, close tag)]``, the ratio index (or None) and the number of
+        decoded tokens.
+        """
+        t, model, device = self.tokens, self.transformer, self.device
+        trigger = t.recaption if bot_task == "recaption" else t.think
+        prefix = edit.edit_prefix(
+            self.tokens, self.system_prompt, prompt, conditions, None, False, ar_trigger=trigger
+        )
+        length = prefix.ids.shape[1]
+        embeds, cos, sin, bound_max, t0, layout, padded = self._edit_inputs(
+            prefix, conditions, prefix.ids
+        )
+        cache_len = padded + _AR_MAX_NEW_TOKENS + _PREFIX_MULTIPLE
+        latents, vit_tokens = encoded
+        k, v, logits = model.ar_prefill(
+            embeds,
+            cos,
+            sin,
+            bound_max,
+            t0,
             latents,
             vit_tokens,
             layout,
+            torch.tensor([length - 1]).to(device),
+            cache_len,
         )
-        return text_k, text_v, length, ids.shape[0]
+        stops = {t.recaption_end} if bot_task != "think" else {t.think_end, t.recaption_end}
+        generated: list[int] = [trigger]
+        forced: list[int] = []
+        ratio_index = None
+        position = length
+        for _ in range(max_new_tokens + 8):
+            if forced:
+                token = forced.pop(0)
+            elif generated[-1] == t.size and predict_ratio:
+                ratio_logits = logits.cpu()[torch.tensor(t.ratio_ids)]
+                ratio_index = int(ratio_logits.argmax())
+                break
+            else:
+                token = self._sample(logits.cpu(), generator)
+            generated.append(token)
+            if token == t.think_end and bot_task == "think_recaption":
+                forced = [t.recaption]
+            elif token in stops or len(generated) > max_new_tokens:
+                if token not in stops:  # out of budget: close the open section
+                    generated.append(t.recaption_end if trigger == t.recaption else t.think_end)
+                if not predict_ratio:
+                    break
+                forced = [t.answer, t.boi, t.size]
+            embed = model.embed(torch.tensor([[token]]))[0].to(device)
+            rcos, rsin = text_rope(1, model.head_dim, model.rope_theta, start=position)
+            logits, k, v = model.decode(
+                embed,
+                rcos.to(device),
+                rsin.to(device),
+                k,
+                v,
+                torch.tensor([position]).to(device),
+            )
+            position += 1
+        # Every rank (both CFG replicas) continues with rank 0's text.
+        if dist.is_initialized():
+            shared = [generated, ratio_index]
+            dist.broadcast_object_list(shared, src=0, group=self._world_cpu_group)
+            generated, ratio_index = shared
+        sections, current, opening = [], [], None
+        for token in generated:
+            if token in (t.think, t.recaption):
+                opening, current = token, []
+            elif token in (t.think_end, t.recaption_end) and opening is not None:
+                text = self.tokenizer.decode(current, skip_special_tokens=False)
+                sections.append((opening, text, token))
+                opening = None
+            elif opening is not None:
+                current.append(token)
+        return sections, ratio_index, position - length
 
     def forward(self, req) -> DiffusionOutput:
         if req.request_ids == ["dummy_req_id"] and self._prompt_of(req.prompts[0]) == "dummy run":
@@ -357,6 +480,11 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             raise NotImplementedError("num_outputs_per_prompt > 1 is not supported")
         prompt = self._prompt_of(req.prompts[0])
         images = self._condition_images(req.prompts[0])
+        bot_task = (sp.extra_args or {}).get("bot_task", "image")
+        if bot_task not in _BOT_TASKS:
+            raise ValueError(f"bot_task must be one of {_BOT_TASKS}, got {bot_task!r}")
+        if bot_task != "image" and not self.instruct:
+            raise NotImplementedError(f"bot_task={bot_task!r} needs the Instruct checkpoint")
         if images and not self.instruct:
             raise NotImplementedError(
                 "image editing needs the HunyuanImage-3.0-Instruct checkpoint"
@@ -365,7 +493,46 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
             edit.prepare_condition(image, self.edit_buckets, self.vit_processor) for image in images
         ]
         buckets = self.edit_buckets if self.instruct else self.buckets
-        if conditions and not (sp.height and sp.width):
+        if sp.seed is not None:
+            generator = torch.Generator("cpu").manual_seed(sp.seed)
+            text_generator = torch.Generator("cpu").manual_seed(sp.seed)
+        else:
+            generator = sp.generator[0] if isinstance(sp.generator, list) else sp.generator
+            text_generator = torch.Generator("cpu").manual_seed(torch.seed())
+        timings: dict[str, float] = {}
+        t_start = time.perf_counter()
+        encoded = self._encode_conditions(conditions, generator) if self.instruct else None
+        timings["condition_seconds"] = time.perf_counter() - t_start
+        cot = None
+        predicted = None
+        if bot_task != "image":
+            # Think / recaption: generate the text first (and the size, if not given).
+            t0 = time.perf_counter()
+            max_new = min(
+                int((sp.extra_args or {}).get("max_new_tokens", _AR_MAX_NEW_TOKENS)),
+                _AR_MAX_NEW_TOKENS,
+            )
+            cot, predicted, num_tokens = self._generate_text(
+                prompt,
+                conditions,
+                encoded,
+                bot_task,
+                not (sp.height and sp.width),
+                text_generator,
+                max_new,
+            )
+            timings["text_seconds"] = time.perf_counter() - t0
+            timings["text_tokens"] = num_tokens
+            logger.info(
+                "HunyuanImage-3.0 %s: %d tokens in %.2f s; %s",
+                bot_task,
+                num_tokens,
+                timings["text_seconds"],
+                " | ".join(text[:300] for _, text, _ in cot),
+            )
+        if predicted is not None:
+            req_h, req_w = buckets[predicted]
+        elif conditions and not (sp.height and sp.width):
             # As vllm-omni: the output takes the first condition image's bucket.
             req_h, req_w = buckets[conditions[0].ratio_index]
         else:
@@ -379,6 +546,7 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         if self.instruct:
             # Prefix (system prompt, condition images, instruction) + the generated image.
             total = len(self.tokenizer.encode(self.system_prompt + prompt)) + 16
+            total += sum(len(self.tokenizer.encode(text)) + 2 for _, text, _ in cot or [])
             total += sum(c.latent_hw[0] * c.latent_hw[1] + 1030 for c in conditions)
             total += latent_h * latent_w
             if total > self.config.max_position_embeddings:
@@ -395,17 +563,11 @@ class NeuronHunyuanImage3Pipeline(nn.Module):
         do_cfg = guidance > 1.0
         model = self.transformer
         device = self.device
-        timings: dict[str, float] = {}
-
-        if sp.seed is not None:
-            generator = torch.Generator("cpu").manual_seed(sp.seed)
-        else:
-            generator = sp.generator[0] if isinstance(sp.generator, list) else sp.generator
 
         t0 = time.perf_counter()
         if self.instruct:
             text_k, text_v, prefix_len, rows = self._prefix_instruct(
-                prompt, conditions, ratio_index, do_cfg, generator
+                prompt, conditions, encoded, ratio_index, do_cfg, cot
             )
         else:
             ids, prefix_len = self._prefix_ids(prompt, ratio_index, do_cfg)

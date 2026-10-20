@@ -47,7 +47,8 @@ The checkpoints are released under the Tencent Hunyuan Community License; check 
 | | Classifier-free guidance (`guidance_scale`, default 5.0 / 2.5 for Instruct, as the checkpoints) | ✅ |
 | | Image editing (Instruct; condition images in `multi_modal_data["image"]`) | ✅ |
 | | Multi-image fusion (several condition images) | ✅ |
-| | Automatic aspect ratio (`image_size="auto"`), think / recaption prompting | ❌ |
+| | Think / recaption prompting (Instruct; `bot_task` `recaption`, `think_recaption`, `think`) | ✅ |
+| | Automatic aspect ratio (predicted after the think / recaption text) | ✅ |
 | **Precision** | BF16 | ✅ |
 | **Parallelism** | Tensor parallelism (TP) of attention heads | ✅ |
 | | Expert parallelism (EP) over the TP ranks | ✅ (always on) |
@@ -128,6 +129,19 @@ computed once per request and the step graph is the text-to-image one. The outpu
 the first condition image's bucket unless a size is given; the prefix is padded to a
 multiple of 1024 tokens.
 
+**Think / recaption** (Instruct, `extra_args={"bot_task": ...}`) first lets the model write
+text, as the official `generate_image`: the reply starts with `<think>` (`think`,
+`think_recaption`) or `<recaption>` (`recaption`); in `think_recaption` the model's
+`</think>` is followed by `<recaption>`, and the text ends at `</recaption>` (at most 2048
+tokens), sampled with the checkpoint's temperature 0.6, top-k 1024 and top-p 0.95 (seeded
+by the request's seed). Without an explicit size, `<answer> <boi> <img_size_1024>` follow
+and the most likely ratio token picks the output bucket. The image pass then uses the
+sequence with the text after `"Assistant: "` (its unconditional row keeps the tags and
+replaces the text with `<cfg>`). Two more graphs run the text: a prefill (the edit prefix
+graph plus the final norm and the vocab-sharded LM head, filling a static KV cache of the
+prefix + 2048 + 1024 positions) and a one-token decode step (attention over the cache,
+the MoE layers at one token, and the LM head); the logits are sampled on the host.
+
 ## Running
 
 ```bash
@@ -175,6 +189,11 @@ omni.generate(
 )
 ```
 
+Think / recaption: `--bot-task recaption` (or `think_recaption`) with `run.py`, or
+`extra_args={"bot_task": "think_recaption"}` in the sampling parameters (with the Instruct
+checkpoint, with or without condition images); `max_new_tokens` in `extra_args` lowers the
+2048-token limit.
+
 `guidance_scale` and the step count default to the checkpoint's (5.0 / 2.5 and 50);
 `guidance_scale <= 1` turns guidance off (one row).
 
@@ -210,6 +229,21 @@ SigLIP2 tower and the prefix graph (system prompt, condition images and instruct
 An edit step costs more than a text-to-image step of the same size because the image
 tokens also attend to the cached prefix (about 1200 system-prompt tokens plus about 5000
 per condition image).
+
+**Think / recaption** (Instruct, TP=16 × CFG=2, 50 steps, guidance 2.5, seed 42, the output
+size predicted by the model). "Text" is the prefill and the token-by-token decode of the
+think / recaption text; "prefix" the image pass's prefix graph.
+
+| Request | Text | Prefix | Denoise | VAE decode | End-to-end |
+|---|---|---|---|---|---|
+| text-to-image, `recaption` (1024x1024) | 11.45 s (306 tokens, 37 ms/token) | 0.14 s | 12.41 s | 0.53 s | 24.58 s |
+| text-to-image, `think_recaption` (1024x1024) | 38.18 s (955 tokens, 40 ms/token) | 0.20 s | 12.50 s | 0.53 s | 51.46 s |
+| edit (cat), `think_recaption` (832x1216) | 15.09 s (376 tokens, 40 ms/token) | 0.47 s | 16.05 s | 0.30 s | 32.49 s |
+
+The edit also spends 0.51 s encoding the condition image. Both CFG replicas generate the
+text (the text is taken from rank 0), so its cost does not depend on CFG parallelism; at
+about 40 ms per token it is dominated by the 32 MoE layers run one token at a time, and
+the text length (set by the model's sampling) decides how much it adds.
 
 TP=16 is the smallest layout that fits the weights (about 13 GB per NeuronCore). On 32
 NeuronCores CFG parallelism is faster than TP=32: each replica runs half the tokens, so
@@ -298,6 +332,18 @@ page.
 *A panoramic view of a futuristic city skyline at dusk, flying cars between glass towers,
 holographic billboards, cinematic lighting* (768x1280 bucket)
 
+### Think / recaption
+
+![think / recaption samples](images/hunyuan-image-3.0/think_recaption_samples.jpg)
+
+*Left to right: text-to-image with `recaption` and with `think_recaption` (prompt: A neon
+shop sign that reads "HUNYUAN IMAGE 3", rainy night, reflections on wet pavement), and the
+cat edit with `think_recaption` (Put a red wizard hat on the cat and change the background
+to a starry night sky). The model's rewritten prompt, e.g. "Add a tall, pointed red wizard
+hat made of velvet with a wide brim onto the cat's head, positioned slightly tilted to one
+side. Replace the plain green background with a deep blue night sky filled with countless
+bright stars and a soft, glowing nebula. ...", decides the details.*
+
 ### Image editing
 
 HunyuanImage-3.0-Instruct on Neuron (TP=16 × CFG=2, 50 steps, guidance 2.5, seed 42):
@@ -336,10 +382,13 @@ logo of image 1 becomes an enamel fridge magnet in the material of image 2 (16.5
 
 ## Known limitations
 
-- **Direct generation only.** The think / recaption modes (the model first writes a
-  reasoning text or an enhanced prompt, autoregressively) and the automatic aspect ratio
-  (`image_size="auto"`, which asks the model for a ratio token) are not implemented: an
-  edit takes the first condition image's bucket, or the given size.
+- **Think / recaption text is sampled, not matched to the reference token for token**: it
+  uses the request's seed (the official code samples from an unseeded global RNG), the
+  condition latents are shared with the image pass, and the two CFG replicas can sample
+  slightly different texts (rank 0's is used). `drop_think` and the automatic aspect
+  ratio of direct generation (`bot_task="image"` without a size, a separate one-token
+  pass officially) are not implemented: direct generation takes the first condition
+  image's bucket, or the given size.
 - **Editing needs the Instruct checkpoint**; the base checkpoint is text-to-image only.
 - **Sizes are the checkpoint's resolution buckets.** Other sizes snap to the nearest
   bucket by aspect ratio, and each bucket compiles its own graphs on first use.

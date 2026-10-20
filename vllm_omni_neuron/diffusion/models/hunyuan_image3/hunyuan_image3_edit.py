@@ -140,6 +140,11 @@ class InstructTokens:
         self.encode = enc
         self.newlines = enc("\n\n")
         self.user, self.assistant = enc("User: "), enc("Assistant: ")
+        # Think / recaption sections of the assistant's reply.
+        self.think, self.think_end = ids("<think>"), ids("</think>")
+        self.recaption, self.recaption_end = ids("<recaption>"), ids("</recaption>")
+        # The ratio tokens in bucket order (37 buckets: 33 ratios, then the extras).
+        self.ratio_ids = [self.ratio(i) for i in range(37)]
 
 
 def edit_prefix(
@@ -147,10 +152,18 @@ def edit_prefix(
     system_prompt: str,
     prompt: str,
     conditions: list[ConditionImage],
-    gen_ratio: int,
+    gen_ratio: int | None,
     cfg: bool,
+    cot: list[tuple[int, str, int]] | None = None,
+    ar_trigger: int | None = None,
 ) -> EditPrefix:
-    """The prefix rows (conditional, and unconditional if ``cfg``) and their layout."""
+    """The prefix rows (conditional, and unconditional if ``cfg``) and their layout.
+
+    ``cot`` holds the assistant's think / recaption sections ``(open tag, text, close
+    tag)`` before the image (their text becomes ``<cfg>`` in the unconditional row).
+    With ``ar_trigger`` the row ends at ``"Assistant: " <ar_trigger>``: the context of
+    the autoregressive think / recaption pass.
+    """
     t = tokens
     head = [t.bos]
     if system_prompt:
@@ -168,10 +181,26 @@ def edit_prefix(
         out.joint_spans.append((base + 4, base + 4 + vae + 1 + _VIT_SLOTS))
         images += [t.img] * vae + [t.sep] + [t.img] * _VIT_SLOTS + [t.eoi]
     text = t.encode(prompt)
-    tail = t.newlines + t.assistant + [t.answer, t.boi, t.size, t.ratio(gen_ratio)]
-    rows = [head + images + text + tail]
-    if cfg:
-        rows.append(head + images + [t.cfg] * len(text) + tail)
+    if ar_trigger is not None:
+        rows = [head + images + text + t.newlines + t.assistant + [ar_trigger]]
+    else:
+        reply, reply_uncond = [], []
+        for open_tag, body, close_tag in cot or []:
+            body_ids = t.encode(body)
+            reply += [open_tag] + body_ids + [close_tag]
+            reply_uncond += [open_tag] + [t.cfg] * len(body_ids) + [close_tag]
+        image = [t.answer, t.boi, t.size, t.ratio(gen_ratio)]
+        rows = [head + images + text + t.newlines + t.assistant + reply + image]
+        if cfg:
+            rows.append(
+                head
+                + images
+                + [t.cfg] * len(text)
+                + t.newlines
+                + t.assistant
+                + reply_uncond
+                + image
+            )
     out.ids = torch.tensor(rows, dtype=torch.long)
     return out
 

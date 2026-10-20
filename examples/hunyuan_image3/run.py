@@ -51,6 +51,14 @@ parser.add_argument(
     "image's resolution bucket unless --height/--width are given.",
 )
 parser.add_argument(
+    "--bot-task",
+    choices=("image", "recaption", "think_recaption", "think"),
+    default="image",
+    help="Instruct only: generate a think / recaption text before the image "
+    "(the output size is then predicted unless --height/--width are given).",
+)
+parser.add_argument("--max-new-tokens", type=int, default=None, help="Think / recaption limit.")
+parser.add_argument(
     "--model-path",
     type=str,
     default=None,
@@ -89,7 +97,8 @@ parser.add_argument(
 parser.add_argument("--profile-runs", type=int, default=3)
 args = parser.parse_args()
 if args.model_path is None:
-    args.model_path = "tencent/HunyuanImage-3.0" + ("-Instruct" if args.image else "")
+    instruct = args.image or args.bot_task != "image"
+    args.model_path = "tencent/HunyuanImage-3.0" + ("-Instruct" if instruct else "")
 
 
 def _stage_config() -> str:
@@ -142,9 +151,15 @@ def main():
         stage_init_timeout=cold_timeout,
         init_timeout=cold_timeout,
     )
+    extra = {"bot_task": args.bot_task}
+    if args.max_new_tokens:
+        extra["max_new_tokens"] = args.max_new_tokens
+    # Think / recaption predict the size; edits default to the first image's bucket.
+    derive = args.image or args.bot_task != "image"
     params = OmniDiffusionSamplingParams(
-        height=args.height or (None if args.image else 1024),
-        width=args.width or (None if args.image else 1024),
+        extra_args=extra,
+        height=args.height or (None if derive else 1024),
+        width=args.width or (None if derive else 1024),
         num_inference_steps=args.steps,
         guidance_scale=args.guidance_scale or 0.0,  # 0: the checkpoint's default
         seed=args.seed,
