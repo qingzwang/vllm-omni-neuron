@@ -216,6 +216,35 @@ NeuronCores CFG parallelism is faster than TP=32: each replica runs half the tok
 both its compute and its collectives halve, while TP=32 only splits the compute further
 (every layer still all-gathers and reduce-scatters all tokens).
 
+### How the text-to-image path was optimized
+
+A step at 1024x1024 with CFG runs about 8,200 tokens through the 32 MoE layers (about
+200 TFLOP). The port was profiled per part on a single NeuronCore at the TP=16 shapes
+(no collectives) and the largest costs were removed in this order:
+
+| Change | Effect |
+|---|---|
+| MoE kernel: `moe_cte` `shard_on_i_hybrid` with `num_static_block=0` instead of `shard_on_block` | `shard_on_block` ignores the occupied-block mask and computes every statically allocated block (about 130 at TP=16, of which about 16 hold tokens); the hybrid kernel's dynamic loop runs only the occupied ones. MoE per layer and step: 53 ms → 4.2 ms |
+| MoE token count padded to a multiple of 2048 | the blockwise token-to-expert mapping then runs as NKI kernels instead of a slow PyTorch fallback (its `indexed_flatten` needs `T / 128` divisible by 16): 7 ms → 0.6 ms per layer |
+| Diffusion heads sharded over TP (patch embed and final layer convolutions split by input / output channels; GroupNorm groups stay whole on a rank) | about 4 TFLOP per step that every rank used to repeat: about 60 ms → about 5 ms per step |
+| Shared expert sequence-parallel (full weights on each rank's 1/TP of the tokens) instead of an intermediate dim sharded to 192 | an efficient matmul shape and no extra collective, about 0.8 ms per layer |
+| Fused NKI QKV kernel (projection, RoPE and the post-RoPE QK RMSNorm in one kernel, head-major output) | 1.42 ms → 0.82 ms per layer |
+| CFG parallelism (each of two TP=16 groups runs one CFG row) | halves both compute and collective volume per group; on 32 NeuronCores 12.25 s vs 15.06 s for TP=32 |
+
+The first four changes took TP=16 from 25.65 s to 21.38 s end to end after the MoE fix
+(the MoE kernel fix came first, before the first full-model run). What remains per layer
+and step at TP=16 is roughly 4 ms of routed experts, 1.4 ms of attention, 0.8 ms of QKV
+projection, and about 5 ms of collectives: the all-gather before attention and the
+experts and the reduce-scatter after them each move all 8,200 tokens x 4096 channels,
+about 40% of the step, which is why TP=32 only gains 1.4x over TP=16.
+
+The VAE was reworked for compile time and memory rather than speed: compiling whole up
+levels on one core (128 channels x 4 frames at 1024x1024) took over 40 minutes per level,
+so the up levels run as row strips over all ranks (exact halos, all-reduced GroupNorm
+statistics), which compiles in about 5 minutes and decodes in about 0.5 s; fusing the last
+three levels into one strip graph keeps their full-resolution intermediates (up to 1 GB)
+from ever being gathered.
+
 ## Accuracy
 
 **Component level** (CPU, FP32, first 2 layers) against the official implementation in
