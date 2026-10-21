@@ -349,6 +349,24 @@ block count drops less (8% for text-to-image, 13% for edits), and the denoising 
 
 The base model keeps the plain expert order (its load has not been measured).
 
+**FP8 weights (not used).** FP8 weights would fit easily (per NeuronCore an Instruct run
+peaks at about 17 GiB of 24 GiB, 13.7 GiB of it tensors), but with the available kernels
+they are not faster at these shapes (single-core benchmarks, e4m3 with TRN2's range of
+240 and per-channel scales):
+
+| Part | BF16 | FP8 | |
+|---|---|---|---|
+| Step MoE layer (`moe_cte` hybrid, 4,100 tokens, 4 experts) | 2.18 ms | 4.59 ms | the kernel upcasts FP8 weights to BF16 before the matmul; the pass is compute-bound |
+| Decode experts (32 layers x 2 experts, one token), dense einsum | 8.34 ms | 7.30 ms | an in-graph dequant is not fused into the weight reads |
+| Decode experts via `moe_tkg` all-expert (dtype check bypassed) | 24.1 ms | 12.5 ms | FP8 halves the kernel's time, but at one token it is 3x slower than the einsum |
+
+FP8 x FP8 matmuls (256x256 block quantization, `double_row`) exist only in the static
+`shard_on_i` kernel, which computes every allocated block rather than the occupied ones.
+Faster decoding with FP8 would need a one-token kernel that reads FP8 weights and
+dequantizes on chip (with an FP8 copy of the experts for decoding, the BF16 weights
+staying for the image pass); FP8 denoising would need block quantization in the hybrid
+kernel. A single MoE layer with per-channel FP8 weights is about 5% off its BF16 output.
+
 The VAE was reworked for compile time and memory rather than speed: compiling whole up
 levels on one core (128 channels x 4 frames at 1024x1024) took over 40 minutes per level,
 so the up levels run as row strips over all ranks (exact halos, all-reduced GroupNorm
