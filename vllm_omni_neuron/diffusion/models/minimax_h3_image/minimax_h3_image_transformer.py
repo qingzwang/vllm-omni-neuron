@@ -310,6 +310,16 @@ class H3Attention(nn.Module):
         set_weight_loader(self.o_weight, _row_weight_loader(local, tp_size))
 
     def forward(self, x, kv_len, cos=None, sin=None):
+        return self.project_out(self.attend(x, kv_len, cos, sin))
+
+    def project_out(self, out):
+        out = torch.matmul(out, self.o_weight)
+        if self.tp_size > 1:
+            dist.all_reduce(out, group=self.tp_group)
+        return out
+
+    def attend(self, x, kv_len, cos=None, sin=None):
+        """QKV projection, QK norm, RoPE and attention: ``[1, S, local_heads * D]`` (pre-O)."""
         qkv = torch.matmul(x, self.qkv_weight)
         q, k, v = qkv.split(self.local_inner, dim=-1)
         q = rms_norm(q.unflatten(-1, (self.num_heads, self.head_dim)), self.norm_q_weight, self.eps)
@@ -321,11 +331,7 @@ class H3Attention(nn.Module):
         if self.cp_size > 1:
             k = self.cp_group.all_gather(k.contiguous(), dim=1)
             v = self.cp_group.all_gather(v.contiguous(), dim=1)
-        out = h3_attention(q, k, v, kv_len)
-        out = torch.matmul(out, self.o_weight)
-        if self.tp_size > 1:
-            dist.all_reduce(out, group=self.tp_group)
-        return out
+        return h3_attention(q, k, v, kv_len)
 
 
 class H3FeedForward(nn.Module):
@@ -389,6 +395,19 @@ def _segment_gate(x, gate, segments, base):
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
 
 
+AUTO_OVERLAP_MAX_TOKENS = 8704
+
+
+def _chunk_bounds(n: int, chunks: int, align: int = 128) -> list[tuple[int, int]]:
+    step = max(align, -(-n // chunks // align) * align)
+    return [(i, min(n, i + step)) for i in range(0, n, step)]
+
+
+def _clip_segments(segments, lo, hi):
+    out = [(max(s, lo), min(e, hi), t) for s, e, t in segments if max(s, lo) < min(e, hi)]
+    return out
+
+
 class H3Block(nn.Module):
     """Pre-norm self-attention + SwiGLU, each AdaLN-modulated per row segment."""
 
@@ -399,16 +418,32 @@ class H3Block(nn.Module):
         self.attn = H3Attention(cfg, use_cp=True)
         self.norm2_weight = nn.Parameter(torch.ones(cfg.hidden_size, dtype=torch.bfloat16))
         self.ff = H3FeedForward(cfg)
+        # >1: split the post-attention tail into token chunks to overlap TP all-reduces;
+        # 0: automatic (see AUTO_OVERLAP_MAX_TOKENS).
+        self.overlap_chunks = 0
 
     def forward(self, x, mod, cos, sin, kv_len, segments, base):
         # mod: [NUM_TABS, 6, H] in diffusers order shift/scale/gate (msa), shift/scale/gate (mlp)
         shift_msa, scale_msa, gate_msa = mod[:, 0], mod[:, 1], mod[:, 2]
         shift_mlp, scale_mlp, gate_mlp = mod[:, 3], mod[:, 4], mod[:, 5]
         h = _segment_modulate(rms_norm(x, self.norm1_weight, self.eps), scale_msa, shift_msa, segments, base)
-        x = x + _segment_gate(self.attn(h, kv_len, cos, sin), gate_msa, segments, base)
-        h = _segment_modulate(rms_norm(x, self.norm2_weight, self.eps), scale_mlp, shift_mlp, segments, base)
-        x = x + _segment_gate(self.ff(h), gate_mlp, segments, base)
-        return x
+        chunks = self.overlap_chunks
+        if chunks == 0:  # auto: overlap pays off up to ~8.7k tokens per core (measured on trn2)
+            chunks = 2 if x.shape[1] <= AUTO_OVERLAP_MAX_TOKENS else 1
+        if chunks <= 1:
+            x = x + _segment_gate(self.attn(h, kv_len, cos, sin), gate_msa, segments, base)
+            h = _segment_modulate(rms_norm(x, self.norm2_weight, self.eps), scale_mlp, shift_mlp, segments, base)
+            return x + _segment_gate(self.ff(h), gate_mlp, segments, base)
+        # Token-chunked tail: every chunk's O-projection / FFN all-reduces are independent of
+        # the other chunks' matmuls, so the compiler can overlap the collectives with compute.
+        a = self.attn.attend(h, kv_len, cos, sin)
+        outs = []
+        for c0, c1 in _chunk_bounds(x.shape[1], chunks):
+            seg = _clip_segments(segments, base + c0, base + c1)
+            xc = x[:, c0:c1] + _segment_gate(self.attn.project_out(a[:, c0:c1]), gate_msa, seg, base + c0)
+            hc = _segment_modulate(rms_norm(xc, self.norm2_weight, self.eps), scale_mlp, shift_mlp, seg, base + c0)
+            outs.append(xc + _segment_gate(self.ff(hc), gate_mlp, seg, base + c0))
+        return torch.cat(outs, dim=1)
 
 
 class _BlockGroup(nn.Module):
