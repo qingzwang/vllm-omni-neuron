@@ -594,6 +594,14 @@ def _fused_tail_fp8(block, x, attn_out, mod, segments, base):
     return x + _segment_gate(block.ff.forward_packed(packed), mod[:, 5], segments, base)
 
 
+def _sub(a, b):
+    return a - b
+
+
+def _add(a, b):
+    return a + b
+
+
 class _BlockGroup(nn.Module):
     """``K`` consecutive blocks; the code of the per-group graph (weights come in as inputs)."""
 
@@ -665,6 +673,7 @@ class MiniMaxH3ImageTransformer(nn.Module):
         # Layout of the packed sequence, set per request by the pipeline (see set_layout).
         self.num_reference_rows = 0
         self.configure_layer_groups(layers_per_graph)
+        self.configure_step_cache(())
 
     # ------------------------------------------------------------------ layout
 
@@ -755,6 +764,26 @@ class MiniMaxH3ImageTransformer(nn.Module):
         self._embed_fn = compile_fn(self.embed, "embed")
         self._group_fn = compile_fn(self.run_group, f"blocks_x{self.layers_per_graph}")
         self._final_fn = compile_fn(self.finalize, "final")
+        self._sub_fn = compile_fn(_sub, "cache_residual")
+        self._add_fn = compile_fn(_add, "cache_reuse")
+
+    # Step cache (Cache-DiT style, static schedule): on ``cache_steps`` the middle block groups
+    # ``[g0, g1)`` are skipped and the residual they added on the previous computed step is
+    # re-applied. The first and last groups always run.
+
+    def configure_step_cache(self, cache_steps=(), block_groups: tuple[int, int] | None = None) -> None:
+        n_groups = len(self.blocks) // self.layers_per_graph
+        self.cache_steps = frozenset(int(s) for s in cache_steps)
+        if block_groups is None:
+            block_groups = (1, n_groups - 1)
+        g0, g1 = int(block_groups[0]), int(block_groups[1])
+        if self.cache_steps and not 0 < g0 < g1 < n_groups + 1:
+            raise ValueError(f"cache block groups {block_groups} out of range for {n_groups} groups")
+        self.cache_groups = (g0, g1)
+        self.reset_step_cache()
+
+    def reset_step_cache(self) -> None:
+        self._cache_residual = None
 
     def forward(
         self,
@@ -767,6 +796,7 @@ class MiniMaxH3ImageTransformer(nn.Module):
         out_mod: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: torch.Tensor,
+        step: int | None = None,
     ) -> torch.Tensor:
         """One denoising step (host orchestration of the compiled pieces).
 
@@ -792,8 +822,21 @@ class MiniMaxH3ImageTransformer(nn.Module):
         run = getattr(self, "_group_fn", self.run_group)
         final = getattr(self, "_final_fn", self.finalize)
         x = embed(image_rows, text_hidden)
-        for g, mods in enumerate(group_mods):
-            x = run(x, mods, cos, sin, kv_len, self._group_params[g])
+        cache_steps = getattr(self, "cache_steps", frozenset())
+        g0, g1 = getattr(self, "cache_groups", (0, 0))
+        reuse = step in cache_steps and self._cache_residual is not None
+        g = 0
+        while g < len(group_mods):
+            if cache_steps and g == g0:
+                if reuse:
+                    x = getattr(self, "_add_fn", _add)(x, self._cache_residual)
+                    g = g1
+                    continue
+                x_in = x
+            x = run(x, group_mods[g], cos, sin, kv_len, self._group_params[g])
+            if cache_steps and not reuse and g == g1 - 1:
+                self._cache_residual = getattr(self, "_sub_fn", _sub)(x, x_in)
+            g += 1
         return final(x, out_mod, head_weight, head_bias)
 
     # ------------------------------------------------------------------ weights

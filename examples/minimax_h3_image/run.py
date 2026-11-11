@@ -33,6 +33,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num-layers", type=int, default=None, help="Truncate the DiT (debug)")
 parser.add_argument("--quantization", choices=["bf16", "fp8_ffn"], default=None,
                     help="DiT FFN precision; fp8_ffn runs the FFN as FP8 W8A8 (Trn2 nkilib ROW kernel)")
+parser.add_argument("--cache-steps", default=None,
+                    help="Comma-separated steps whose middle block groups reuse the previous step's residual, e.g. 3,5")
 parser.add_argument("--output", default="minimax_h3_image.png")
 parser.add_argument("--profile", action="store_true", help="Run timed warm generations after the first")
 parser.add_argument("--profile-runs", type=int, default=3)
@@ -49,6 +51,8 @@ def main():
         model_config["num_layers"] = args.num_layers
     if args.quantization is not None:
         model_config["quantization"] = args.quantization
+    if args.cache_steps:
+        model_config["cache_steps"] = [int(s) for s in args.cache_steps.split(",")]
 
     cold_timeout = int(os.environ.get("H3_HANDSHAKE_TIMEOUT_S", "3600"))
     try:

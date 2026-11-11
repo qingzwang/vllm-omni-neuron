@@ -56,6 +56,9 @@ PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
 HOST_POSTPROCESS_THREADS = int(os.environ.get("MINIMAX_H3_IMAGE_HOST_THREADS", "32"))
 
+# The hierarchy splitter's partitions change intermediate precision (as for Wan): without
+# this flag blocks are ~8% faster, but the six-step trajectory visibly drifts from the
+# reference (e.g. different horn shapes in the reference prompt). Keep it.
 _COMPILER_ARGS = [
     "--model-type=transformer",
     "--auto-cast=none",
@@ -149,6 +152,12 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             tf_cfg,
             layers_per_graph=int(overrides.get("layers_per_graph", 5)),
             quantization=overrides.get("quantization"),
+        )
+        # Static step cache: e.g. cache_steps [3, 5] reuses the middle block groups' residual
+        # from the previous step (~29% less DiT work; see the model card for quality).
+        self.transformer.configure_step_cache(
+            overrides.get("cache_steps", ()),
+            tuple(overrides["cache_block_groups"]) if overrides.get("cache_block_groups") else None,
         )
         # Token chunks of each block's post-attention tail, so TP all-reduces overlap matmuls.
         for block in self.transformer.blocks:
@@ -293,9 +302,12 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         else:
             noise = torch.randn((1, cfg.in_channels, 1, lh, lw), generator=self._generator(sp), dtype=torch.float32)
         latents = patchify(noise[:, :, 0])
+        self.transformer.reset_step_cache()
         for i in range(len(self.timesteps)):
             mods, out_mod, head_w, head_b = self._step_tables[i]
-            v = self.transformer(latents[None].to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b)
+            v = self.transformer(
+                latents[None].to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b, step=i
+            )
             v = v.cpu()[0, :n_img].float()
             latents = latents + (self.sigmas[i] - self.sigmas[i + 1]) * v
         timings["denoise_s"] = time.perf_counter() - t0

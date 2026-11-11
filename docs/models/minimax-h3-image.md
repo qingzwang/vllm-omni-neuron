@@ -46,7 +46,7 @@ The pipeline reads `transformer_diffusers/`, `vae_diffusers/`, `text_encoder/`,
 | **Parallelism** | Tensor parallelism (TP=8, 7 heads per rank) | ✅ |
 | | Context parallelism over the packed sequence (`ring_degree`) | ✅ |
 | | Tile-parallel VAE decode over all ranks | ✅ |
-| **Acceleration** | Cache-DiT | ❌ Not yet |
+| **Acceleration** | Static step cache (`cache_steps: [3, 5]`) | ✅ (opt-in) |
 | **Compilation** | `torch.compile`, one block-group graph reused for all 50 blocks | ✅ |
 
 ### How the Neuron implementation differs from the reference
@@ -72,6 +72,9 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
 - **All-reduce overlap.** Each block's post-attention tail runs in two token chunks when a
   core holds at most 8704 tokens (`overlap_chunks`, 0 = automatic), so one chunk's TP
   all-reduce overlaps the other chunk's matmuls.
+- **Compiler flags.** `--internal-hlo2tensorizer-options=--hierarchy-splitter=false` is kept
+  (as for Wan): without it blocks run ~8% faster, but intermediate precision changes enough
+  for the six-step trajectory to drift visibly from the reference.
 - **Text encoder.** Only the 50 layers that feed `hidden_states[50]` are built (TP over
   the same TP group as the DiT); the token embedding lookup runs on the host.
 - **VAE decode.** The reference decodes in overlapping 256-pixel tiles of identical
@@ -154,10 +157,38 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 | 16 | 2048x2048 | 8 ms | 1.91 s | 0.20 s | **2.23 s** | 54 s |
 | 16 | 4096x4096 | 11 ms | 9.91 s | 0.68 s | **11.0 s** | 111 s |
 
-**Where the time goes** (one 5-block group at 2048x2048 on 8 cores, 4352 tokens per core):
-~11.7 ms per block, of which ~3.5 ms is the two TP all-reduces (47 MB each), ~6.4 ms the
-projection matmuls (~40% of BF16 peak) and ~1.9 ms attention. Fusing communication and
-elementwise work into the projection kernels is the next optimization step.
+**Where the time goes** (device profile of one warm 2048x2048 request on 8 cores, rank 0):
+the device is busy 99% of the request. The DiT block groups take 95% (60 launches of
+53.6 ms), the VAE decode 131 ms, the text encoder 32 ms, and host gaps between launches
+33 ms in total. Inside a block (10.7 ms): the tensor engine computes for 7.6 ms (71%, about
+38% of BF16 peak; the compiled graph reloads weight tiles about once per matmul pass), TP
+all-reduces are exposed for 1.25 ms (12%, the rest overlaps compute), elementwise work with
+the tensor engine idle takes 1.4 ms (13%) and nothing runs for 0.4 ms (4%). Raising
+in-graph matmul efficiency is the main remaining lever.
+
+## Step cache
+
+The model samples only six steps, so a dynamic Cache-DiT policy has almost nothing to decide;
+a static schedule is used instead. With `model_config.cache_steps: [3, 5]` (or
+`run.py --cache-steps 3,5`), steps 3 and 5 skip the middle block groups (blocks 5-44, set
+with `cache_block_groups`, default all but the first and last group) and re-apply the
+residual those blocks added on the previous computed step. The first and last five blocks
+always run. That removes ~27% of the DiT work.
+
+Quality was chosen on the CPU reference (2048x2048, PSNR against the uncached reference):
+steps 3 and 5 give 30.8 dB (no visible change), adding step 2 drops to 24.2 dB, and a
+windowed sparse attention with similar savings drops to 22.9-28.2 dB with visible background
+changes, so sparse attention is not offered.
+
+Warm request latency on Trn2, without / with `cache_steps: [3, 5]` (PSNR against the CPU
+reference in parentheses):
+
+| Cores | 1024x1024 | 2048x2048 | 4096x4096 |
+|---|---|---|---|
+| 8 | 1.11 s (28.2 dB) / **0.84 s** (26.3 dB) | 3.64 s (27.8 dB) / **2.77 s** (26.2 dB) | 16.2 s (30.1 dB) / **12.3 s** (26.8 dB) |
+| 16 | 0.70 s (24.9 dB) / **0.55 s** (23.7 dB) | 2.22 s (34.1 dB) / **1.73 s** (29.3 dB) | 11.0 s (30.8 dB) / **8.35 s** (27.1 dB) |
+
+The cached images are visually indistinguishable from the uncached ones at all sizes.
 
 ## Quantization (experimental)
 
