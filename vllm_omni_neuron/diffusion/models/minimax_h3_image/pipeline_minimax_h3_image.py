@@ -54,6 +54,7 @@ MAX_SEQUENCE_LENGTH = 4096
 DEFAULT_TEXT_BUCKETS = (256, 512, 1024, 2048, 4096)
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
+HOST_POSTPROCESS_THREADS = int(os.environ.get("MINIMAX_H3_IMAGE_HOST_THREADS", "32"))
 
 _COMPILER_ARGS = [
     "--model-type=transformer",
@@ -92,15 +93,21 @@ def _resolve_text_encoder_path(model_path: str) -> str:
 
 
 def get_minimax_h3_image_post_process_func(od_config):
-    """``[B, 3, H, W]`` float images in ``[0, 1]`` -> list of PIL images."""
+    """``[B, 3, H, W]`` uint8 images (or float in ``[0, 1]``) -> list of PIL images."""
     from PIL import Image
 
     def post_process_func(images, output_type: str = "pil", sampling_params=None):
         if images is None:
             return images
-        if output_type in ("pt", "latent"):
+        if output_type == "latent":
             return images
-        arr = (images.float().clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+        if output_type == "pt":
+            return images.float() / 255.0 if images.dtype == torch.uint8 else images
+        if not isinstance(images, torch.Tensor):
+            images = torch.as_tensor(images)
+        if images.dtype != torch.uint8:
+            images = (images.float().clamp(0, 1) * 255).round().to(torch.uint8)
+        arr = images.permute(0, 2, 3, 1).cpu().numpy()
         if output_type == "np":
             return arr
         return [Image.fromarray(a) for a in arr]
@@ -294,11 +301,22 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         if getattr(sp, "output_type", None) == "latent":
             return unpatchify(latents, lh, lw) if self.is_output_rank else None
 
-        # 4. VAE decode (tile-parallel)
+        # 4. VAE decode (tile-parallel). Workers run single-threaded; the output rank alone
+        # does the host-side stitching and post-processing, so give it more threads.
         t0 = time.perf_counter()
+        prev_threads = torch.get_num_threads()
+        if self.is_output_rank:
+            torch.set_num_threads(HOST_POSTPROCESS_THREADS)
+        try:
+            return self._decode_and_postprocess(latents, lh, lw, out_h, out_w, timings, t0, t_all,
+                                                height, width, num_text, text_pad)
+        finally:
+            torch.set_num_threads(prev_threads)
+
+    def _decode_and_postprocess(self, latents, lh, lw, out_h, out_w, timings, t0, t_all,
+                                height, width, num_text, text_pad):
         image = self._decode(latents, lh, lw)
         timings["vae_decode_s"] = time.perf_counter() - t0
-        timings["total_s"] = time.perf_counter() - t_all
         if not self.is_output_rank:
             return None
 
@@ -312,10 +330,13 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
 
             pil = Image.fromarray(image[0].permute(1, 2, 0).numpy()).resize((out_w, out_h), Image.LANCZOS)
             image = torch.from_numpy(__import__("numpy").array(pil)).permute(2, 0, 1)[None]
+        timings["postprocess_s"] = time.perf_counter() - t0 - timings["vae_decode_s"]
+        timings["total_s"] = time.perf_counter() - t_all
         timings.update(height=height, width=width, text_tokens=num_text, text_pad=text_pad)
         self._last_timings = timings
         logger.info("MiniMax-H3-Image request timings: %s", timings)
-        return image.float() / 255.0
+        # uint8 [1, 3, H, W]: 4x less to ship back to the engine than float.
+        return image.contiguous()
 
     def _decode(self, latents: torch.Tensor, lh: int, lw: int) -> torch.Tensor | None:
         vae = self.vae
@@ -329,7 +350,9 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             y, hh, x, ww = slices[t]
             batch[j] = z[0, :, y : y + hh, x : x + ww]
         cos, sin = vae.rope_tables(th, tw)
-        out = self._vae_fn(batch.to(self.device), cos.to(self.device), sin.to(self.device)).cpu().float()
+        t0 = time.perf_counter()
+        out = self._vae_fn(batch.to(self.device), cos.to(self.device), sin.to(self.device)).cpu()
+        t1 = time.perf_counter()
         if self.world == 1:
             tiles = out[:n]
         else:
@@ -338,8 +361,14 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             if not self.is_output_rank:
                 return None
             tiles = torch.cat(gathered)[:n]
-        grid = [[tiles[i * nx + j : i * nx + j + 1] for j in range(nx)] for i in range(ny)]
-        return stitch_tiles(grid, yo, xo)
+        t2 = time.perf_counter()
+        grid = [[tiles[i * nx + j : i * nx + j + 1].float() for j in range(nx)] for i in range(ny)]
+        image = stitch_tiles(grid, yo, xo)
+        logger.info(
+            "VAE decode: %d tiles, device %.3fs, gather %.3fs, stitch %.3fs",
+            n, t1 - t0, t2 - t1, time.perf_counter() - t2,
+        )
+        return image
 
     def forward(self, req):
         if getattr(self, "skip_warmup", False) and list(getattr(req, "request_ids", []) or []) == ["dummy_req_id"]:

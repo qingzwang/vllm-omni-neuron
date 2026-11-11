@@ -75,8 +75,9 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
 - **Text encoder.** Only the 50 layers that feed `hidden_states[50]` are built (TP over
   the same TP group as the DiT); the token embedding lookup runs on the host.
 - **VAE decode.** The reference decodes in overlapping 256-pixel tiles of identical
-  shape; tiles are batched across all ranks and stitched on rank 0 with the reference
-  blending.
+  shape; tiles are batched across all ranks, gathered in bf16 (the decoder's output
+  precision) and stitched on rank 0 with the reference blending. The image is returned to
+  the engine as uint8.
 
 ### Recommended configurations
 
@@ -148,10 +149,10 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 |---|---|---|---|---|---|---|
 | 8 | 1024x1024 | 8 ms | 1.01 s | 0.07 s | **1.14 s** | 55 s |
 | 8 | 2048x2048 | 8 ms | 3.27 s | 0.39 s | **3.99 s** | 72 s |
-| 8 | 4096x4096 | 10 ms | 14.8 s | 1.41 s | **17.6 s** | 298 s |
+| 8 | 4096x4096 | 8 ms | 14.8 s | 0.91 s | **16.2 s** | 298 s |
 | 16 | 1024x1024 | 8 ms | 0.62 s | 0.06 s | **0.74 s** | 50 s |
-| 16 | 2048x2048 | 9 ms | 1.91 s | 0.30 s | **2.52 s** | 54 s |
-| 16 | 4096x4096 | 9 ms | 9.91 s | 1.11 s | **12.3 s** | 111 s |
+| 16 | 2048x2048 | 8 ms | 1.91 s | 0.20 s | **2.23 s** | 54 s |
+| 16 | 4096x4096 | 11 ms | 9.91 s | 0.68 s | **11.0 s** | 111 s |
 
 **Where the time goes** (one 5-block group at 2048x2048 on 8 cores, 4352 tokens per core):
 ~11.7 ms per block, of which ~3.5 ms is the two TP all-reduces (47 MB each), ~6.4 ms the

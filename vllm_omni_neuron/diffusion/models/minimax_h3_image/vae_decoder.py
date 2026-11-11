@@ -62,8 +62,9 @@ class _Block(nn.Module):
 
         q, k = rope(q), rope(k)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) / math.sqrt(self.head_dim)
-        out = torch.matmul(torch.softmax(scores, dim=-1), v.float()).to(x.dtype)
+        # bf16 matmuls with an fp32 softmax (the reference runs bf16 SDPA).
+        scores = torch.matmul(q * (1.0 / math.sqrt(self.head_dim)), k.transpose(-2, -1)).float()
+        out = torch.matmul(torch.softmax(scores, dim=-1).to(x.dtype), v)
         out = out.transpose(1, 2).reshape(b, s, -1)
         return torch.matmul(out, self.o_weight) + self.o_bias
 
@@ -182,7 +183,8 @@ class NeuronMiniMaxH3ImageVAEDecoder(nn.Module):
             x = blk(x, cos_c, sin_c, cd)
         x = F.layer_norm(x.float(), (self.dim,), self.norm_out_weight, self.norm_out_bias, self.eps).to(cd)
         x = torch.matmul(x, self.proj_out_weight) + self.proj_out_bias
-        x = x[:, :n].float()
+        # proj_out runs in the compute dtype, so returning it as such loses nothing.
+        x = x[:, :n]
         r = self.ratio
         x = x.view(b, h, w, 3, r, r).permute(0, 3, 1, 4, 2, 5)
         return x.reshape(b, 3, h * r, w * r)
