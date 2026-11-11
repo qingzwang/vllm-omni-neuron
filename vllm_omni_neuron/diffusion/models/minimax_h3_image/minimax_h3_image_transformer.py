@@ -276,6 +276,27 @@ def _cast_weight_loader(loader, dtype):
 # ===================================================================
 
 
+def _all_reduce(x, group):
+    dist.all_reduce(x, group=group)
+    return x
+
+
+def tp_all_gather_rows(x: torch.Tensor, group, n: int) -> torch.Tensor:
+    """``[1, S/n, H]`` per rank -> ``[1, S, H]`` (rank order) over the TP group."""
+    _, s, h = x.shape
+    out = torch.empty((s * n, h), dtype=x.dtype, device=x.device)
+    dist.all_gather_into_tensor(out, x.reshape(s, h), group=group)
+    return out.reshape(1, s * n, h)
+
+
+def tp_reduce_scatter_rows(x: torch.Tensor, group, n: int) -> torch.Tensor:
+    """``[1, S, H]`` partial sums -> this rank's ``[1, S/n, H]`` rows of the sum."""
+    _, s, h = x.shape
+    out = torch.empty((s // n, h), dtype=x.dtype, device=x.device)
+    dist.reduce_scatter_tensor(out, x.reshape(s, h), op=dist.ReduceOp.SUM, group=group)
+    return out.reshape(1, s // n, h)
+
+
 class H3Attention(nn.Module):
     """TP self-attention: fused column-parallel QKV, per-head QK RMSNorm, row-parallel out."""
 
@@ -312,10 +333,10 @@ class H3Attention(nn.Module):
     def forward(self, x, kv_len, cos=None, sin=None):
         return self.project_out(self.attend(x, kv_len, cos, sin))
 
-    def project_out(self, out):
+    def project_out(self, out, scatter: bool = False):
         out = torch.matmul(out, self.o_weight)
         if self.tp_size > 1:
-            dist.all_reduce(out, group=self.tp_group)
+            out = tp_reduce_scatter_rows(out, self.tp_group, self.tp_size) if scatter else _all_reduce(out, self.tp_group)
         return out
 
     def attend(self, x, kv_len, cos=None, sin=None):
@@ -351,12 +372,12 @@ class H3FeedForward(nn.Module):
         self.down_weight = nn.Parameter(torch.empty(self.shard, hidden, dtype=torch.bfloat16))
         set_weight_loader(self.down_weight, _row_weight_loader(self.shard, tp_size))
 
-    def forward(self, x):
+    def forward(self, x, scatter: bool = False):
         h = torch.matmul(x, self.up_gate_weight)
         value, gate = h.split(self.shard, dim=-1)
         out = torch.matmul(value * F.silu(gate), self.down_weight)
         if self.tp_size > 1:
-            dist.all_reduce(out, group=self.tp_group)
+            out = tp_reduce_scatter_rows(out, self.tp_group, self.tp_size) if scatter else _all_reduce(out, self.tp_group)
         return out
 
 
@@ -544,12 +565,24 @@ class H3Block(nn.Module):
         # >1: split the post-attention tail into token chunks to overlap TP all-reduces;
         # 0: automatic (see AUTO_OVERLAP_MAX_TOKENS).
         self.overlap_chunks = 0
+        # Megatron-style sequence parallelism inside the TP group: between the projections the
+        # residual stream holds only this TP rank's 1/tp of the rows (set by the model).
+        self.sequence_parallel = False
 
     def forward(self, x, mod, cos, sin, kv_len, segments, base):
         # mod: [NUM_TABS, 6, H] in diffusers order shift/scale/gate (msa), shift/scale/gate (mlp)
         shift_msa, scale_msa, gate_msa = mod[:, 0], mod[:, 1], mod[:, 2]
         shift_mlp, scale_mlp, gate_mlp = mod[:, 3], mod[:, 4], mod[:, 5]
         h = _segment_modulate(rms_norm(x, self.norm1_weight, self.eps), scale_msa, shift_msa, segments, base)
+        if self.sequence_parallel:
+            # x / h are this TP rank's rows; gather for the column-parallel projections and
+            # reduce-scatter their row-parallel outputs back (same bytes as an all-reduce).
+            tp = self.attn.tp_size
+            a = self.attn.attend(tp_all_gather_rows(h, self.attn.tp_group, tp), kv_len, cos, sin)
+            x = x + _segment_gate(self.attn.project_out(a, scatter=True), gate_msa, segments, base)
+            h = _segment_modulate(rms_norm(x, self.norm2_weight, self.eps), scale_mlp, shift_mlp, segments, base)
+            f = self.ff(tp_all_gather_rows(h, self.attn.tp_group, tp), scatter=True)
+            return x + _segment_gate(f, gate_mlp, segments, base)
         if isinstance(self.ff, H3FeedForwardFP8) and can_run_kernel(x):
             return self._forward_fused_fp8(x, h, mod, cos, sin, kv_len, segments, base)
         chunks = self.overlap_chunks
@@ -646,6 +679,7 @@ class MiniMaxH3ImageTransformer(nn.Module):
         num_layers: int | None = None,
         layers_per_graph: int | None = 5,
         quantization: str | None = None,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         if config is None:
@@ -682,6 +716,11 @@ class MiniMaxH3ImageTransformer(nn.Module):
 
         # Layout of the packed sequence, set per request by the pipeline (see set_layout).
         self.num_reference_rows = 0
+        self.sequence_parallel = bool(sequence_parallel) and self.tp_size > 1
+        if self.sequence_parallel and self.quantization == "fp8_ffn":
+            raise ValueError("sequence_parallel is not supported with quantization='fp8_ffn'")
+        for block in self.blocks:
+            block.sequence_parallel = self.sequence_parallel
         self.configure_layer_groups(layers_per_graph)
         self.configure_step_cache(())
 
@@ -754,6 +793,9 @@ class MiniMaxH3ImageTransformer(nn.Module):
         if self.cp_size > 1:
             local = total // self.cp_size
             x = x[:, self.cp_rank * local : (self.cp_rank + 1) * local]
+        if self.sequence_parallel:
+            n = x.shape[1] // self.tp_size
+            x = x[:, self.tp_rank * n : (self.tp_rank + 1) * n]
         return x
 
     def run_group(self, x, mods, cos, sin, kv_len, params):
@@ -765,6 +807,8 @@ class MiniMaxH3ImageTransformer(nn.Module):
         h = rms_norm(x, self.norm_out_weight, self.config.final_norm_eps)
         h = h * (1.0 + out_mod[1]) + out_mod[0]
         out = torch.matmul(h.float(), head_weight) + head_bias
+        if self.sequence_parallel:
+            out = tp_all_gather_rows(out.contiguous(), get_tp_group().device_group, self.tp_size)
         if self.cp_size > 1:
             out = self.cp_group.all_gather(out.contiguous(), dim=1)
         return out
@@ -825,6 +869,13 @@ class MiniMaxH3ImageTransformer(nn.Module):
         n_img = image_rows.shape[1]
         total = n_img + text_hidden.shape[1]
         segments, base = self._segments(n_img, total)
+        if self.sequence_parallel:
+            local = total // self.cp_size
+            if local % (self.tp_size * 16):
+                raise ValueError(f"{local} rows per CP rank do not split over TP={self.tp_size}")
+            n = local // self.tp_size
+            base = base + self.tp_rank * n
+            segments = _clip_segments(segments, base, base + n)
         self._group_template.set_segments(segments, base)
         if not hasattr(self, "_group_params"):
             self._group_params = [self.group_params(g) for g in range(len(group_mods))]

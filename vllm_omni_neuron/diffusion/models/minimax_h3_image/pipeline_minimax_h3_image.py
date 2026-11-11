@@ -152,6 +152,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             tf_cfg,
             layers_per_graph=int(overrides.get("layers_per_graph", 5)),
             quantization=overrides.get("quantization"),
+            sequence_parallel=bool(overrides.get("sequence_parallel", True)) and overrides.get("quantization") != "fp8_ffn",
         )
         # Static step cache: e.g. cache_steps [3, 5] reuses the middle block groups' residual
         # from the previous step (~29% less DiT work; see the model card for quality).

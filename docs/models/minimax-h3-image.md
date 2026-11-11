@@ -78,6 +78,11 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
 - **Compiler flags.** `--internal-hlo2tensorizer-options=--hierarchy-splitter=false` is kept
   (as for Wan): without it blocks run ~8% faster, but intermediate precision changes enough
   for the six-step trajectory to drift visibly from the reference.
+- **Sequence parallelism inside the TP group** (`sequence_parallel`, default on). Between
+  the projections each TP rank keeps only 1/8 of its rows: the all-reduce after the output
+  and down projections becomes a reduce-scatter, and an all-gather precedes QKV and the FFN
+  (same bytes), so the norms, modulation, gates and residual adds run on 1/8 of the rows
+  (-18% per block).
 - **Text encoder.** Only the 50 layers that feed `hidden_states[50]` are built (TP over
   the same TP group as the DiT); the token embedding lookup runs on the host.
 - **VAE decode.** The reference decodes in overlapping 256-pixel tiles of identical
@@ -153,12 +158,12 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 
 | Cores | Resolution | Denoise (6 steps) | VAE decode | Request | PSNR vs reference |
 |---|---|---|---|---|---|
-| 8 | 1024x1024 | 0.82 s | 0.05 s | **0.91 s** | 29.0 dB |
-| 8 | 2048x2048 | 2.54 s | 0.24 s | **2.90 s** | 30.5 dB |
-| 8 | 4096x4096 | 13.1 s | 0.97 s | **14.4 s** | 30.1 dB |
-| 16 | 1024x1024 | 0.56 s | 0.04 s | **0.63 s** | 23.4 dB |
-| 16 | 2048x2048 | 1.67 s | 0.18 s | **1.97 s** | 34.3 dB |
-| 16 | 4096x4096 | 7.11 s | 0.61 s | **8.19 s** | 30.4 dB |
+| 8 | 1024x1024 | 0.66 s | 0.05 s | **0.75 s** | 23.6 dB |
+| 8 | 2048x2048 | 2.19 s | 0.23 s | **2.55 s** | 34.0 dB |
+| 8 | 4096x4096 | 12.2 s | 0.89 s | **13.4 s** | 30.1 dB |
+| 16 | 1024x1024 | 0.47 s | 0.04 s | **0.55 s** | 22.9 dB |
+| 16 | 2048x2048 | 1.35 s | 0.20 s | **1.68 s** | 30.2 dB |
+| 16 | 4096x4096 | 6.19 s | 0.62 s | **7.28 s** | 30.2 dB |
 
 Text encoding takes 8-20 ms in every configuration. Cold first requests compile for
 ~1-5 minutes (one compiled 5-block graph is reused for all 50 blocks).
