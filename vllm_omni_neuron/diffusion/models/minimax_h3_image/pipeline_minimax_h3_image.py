@@ -146,7 +146,9 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         if tf_cfg.num_pdd_heads != len(self.timesteps):
             raise ValueError(f"{tf_cfg.num_pdd_heads} PDD heads for {len(self.timesteps)} sampling steps")
         self.transformer = MiniMaxH3ImageTransformer(
-            tf_cfg, layers_per_graph=int(overrides.get("layers_per_graph", 5))
+            tf_cfg,
+            layers_per_graph=int(overrides.get("layers_per_graph", 5)),
+            quantization=overrides.get("quantization"),
         )
         # Token chunks of each block's post-attention tail, so TP all-reduces overlap matmuls.
         for block in self.transformer.blocks:

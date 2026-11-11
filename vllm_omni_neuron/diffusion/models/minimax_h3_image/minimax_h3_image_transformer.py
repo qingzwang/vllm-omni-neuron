@@ -360,6 +360,112 @@ class H3FeedForward(nn.Module):
         return out
 
 
+# ===================================================================
+# FP8 FFN (Trn2): nkilib MLP kernel, ROW quantization (W8A8)
+# ===================================================================
+
+FP8 = torch.float8_e4m3fn
+# Trn2's FP8 e4m3 has no OCP extension: the largest finite value is 240, and every code up to
+# it has the same bits as float8_e4m3fn, so quantizing to +-240 is format-exact.
+FP8_MAX = 240.0
+
+
+def _fp8_cols(w: torch.Tensor):
+    """``[K, N]`` -> (fp8 codes, ``[128, N]`` fp32 per-column dequant scale)."""
+    scale = (w.float().abs().amax(dim=0, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+    return (w.float() / scale).to(FP8), scale.expand(128, -1).contiguous()
+
+
+def _fp8_weight_loader(base: SafetensorsWeightLoader, part: str):
+    def transform(slices, rank):
+        codes, scale = _fp8_cols(base.load(slices, rank))
+        return codes if part == "codes" else scale
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def row_pack_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``[B, S, H]`` -> ``[B, S, H + 4]`` fp8: per-row codes and the fp32 scale's four bytes."""
+    scale = (x.float().abs().amax(dim=-1, keepdim=True) / FP8_MAX).clamp(min=1e-5)
+    codes = (x.float() / scale).to(FP8)
+    return torch.cat([codes, scale.contiguous().view(torch.uint8).view(FP8)], dim=-1)
+
+
+@nki.jit
+def _h3_fp8_mlp_kernel(x, g, u, d, gs, us, ds):
+    from nkilib.core.mlp.mlp import mlp as nkilib_mlp
+    from nkilib.core.utils.common_types import ActFnType, DtypeMode, NormType, QuantizationType
+
+    return nkilib_mlp(
+        hidden_tensor=x, gate_proj_weights_tensor=g, up_proj_weights_tensor=u, down_proj_weights_tensor=d,
+        normalization_weights_tensor=None, gate_proj_bias_tensor=None, up_proj_bias_tensor=None,
+        down_proj_bias_tensor=None, normalization_bias_tensor=None, fused_add_tensor=None,
+        store_fused_add_result=False, activation_fn=ActFnType.SiLU, normalization_type=NormType.NO_NORM,
+        quantization_type=QuantizationType.ROW, gate_w_scale=gs, up_w_scale=us, down_w_scale=ds,
+        gate_up_in_scale=None, down_in_scale=None, quant_clipping_bound=0.0, output_dtype=nl.bfloat16,
+        store_output_in_sbuf=False, eps=1e-6, skip_gate_proj=False, use_tkg_gate_up_proj_column_tiling=True,
+        use_tkg_down_proj_column_tiling=True, use_tkg_down_proj_optimized_layout=False,
+        gate_clamp_upper_limit=None, gate_clamp_lower_limit=None, up_clamp_upper_limit=None,
+        up_clamp_lower_limit=None, force_cte_mode=False, dtype_mode=DtypeMode.AUTO,
+    )
+
+
+@nki_op("minimax_h3_image::fp8_mlp")
+def _h3_nki_fp8_mlp(
+    x: torch.Tensor, g: torch.Tensor, u: torch.Tensor, d: torch.Tensor,
+    gs: torch.Tensor, us: torch.Tensor, ds: torch.Tensor,
+) -> torch.Tensor:
+    return wrap_nki_kernel(_h3_fp8_mlp_kernel, supported_lnc=(2,))(x, g, u, d, gs, us, ds)
+
+
+class H3FeedForwardFP8(nn.Module):
+    """TP SwiGLU with FP8 W8A8 projections (per-column weight, per-row activation scales)."""
+
+    def __init__(self, cfg: MiniMaxH3ImageConfig):
+        super().__init__()
+        tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = tp_size
+        self.tp_group = get_tp_group().device_group
+        self.shard = shard = cfg.ffn_dim // tp_size
+        H = cfg.hidden_size
+
+        def param(shape, dtype):
+            return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
+
+        self.gate_w8, self.up_w8, self.down_w8 = param((H, shard), FP8), param((H, shard), FP8), param((shard, H), FP8)
+        self.gate_s, self.up_s, self.down_s = (
+            param((128, shard), torch.float32), param((128, shard), torch.float32), param((128, H), torch.float32)
+        )
+
+        def half(which):  # value (up) is the first half of ff.net.0.proj, gate the second
+            def t(slices, rank):
+                sl = slices[0]
+                off = (cfg.ffn_dim if which == "gate" else 0) + rank * shard
+                return sl[off : off + shard, :].T
+            return SafetensorsWeightLoader(transform=t)
+
+        down = _row_weight_loader(shard, tp_size)
+        for name, base in (("gate", half("gate")), ("up", half("up")), ("down", down)):
+            set_weight_loader(getattr(self, f"{name}_w8"), _fp8_weight_loader(base, "codes"))
+            set_weight_loader(getattr(self, f"{name}_s"), _fp8_weight_loader(base, "scale"))
+
+    def _dequant(self, w8, s):
+        return w8.float() * s[:1]
+
+    def forward(self, x):
+        if can_run_kernel(x):
+            out = _h3_nki_fp8_mlp(
+                row_pack_fp8(x), self.gate_w8, self.up_w8, self.down_w8, self.gate_s, self.up_s, self.down_s
+            )
+        else:
+            xf = x.float()
+            h = F.silu(xf @ self._dequant(self.gate_w8, self.gate_s)) * (xf @ self._dequant(self.up_w8, self.up_s))
+            out = (h @ self._dequant(self.down_w8, self.down_s)).to(x.dtype)
+        if self.tp_size > 1:
+            dist.all_reduce(out, group=self.tp_group)
+        return out
+
+
 class H3RefinerBlock(nn.Module):
     def __init__(self, cfg: MiniMaxH3ImageConfig):
         super().__init__()
@@ -411,13 +517,13 @@ def _clip_segments(segments, lo, hi):
 class H3Block(nn.Module):
     """Pre-norm self-attention + SwiGLU, each AdaLN-modulated per row segment."""
 
-    def __init__(self, cfg: MiniMaxH3ImageConfig):
+    def __init__(self, cfg: MiniMaxH3ImageConfig, quantization: str | None = None):
         super().__init__()
         self.eps = cfg.norm_eps
         self.norm1_weight = nn.Parameter(torch.ones(cfg.hidden_size, dtype=torch.bfloat16))
         self.attn = H3Attention(cfg, use_cp=True)
         self.norm2_weight = nn.Parameter(torch.ones(cfg.hidden_size, dtype=torch.bfloat16))
-        self.ff = H3FeedForward(cfg)
+        self.ff = H3FeedForwardFP8(cfg) if quantization == "fp8_ffn" else H3FeedForward(cfg)
         # >1: split the post-attention tail into token chunks to overlap TP all-reduces;
         # 0: automatic (see AUTO_OVERLAP_MAX_TOKENS).
         self.overlap_chunks = 0
@@ -479,6 +585,7 @@ class MiniMaxH3ImageTransformer(nn.Module):
         config: MiniMaxH3ImageConfig | dict | None = None,
         num_layers: int | None = None,
         layers_per_graph: int | None = 5,
+        quantization: str | None = None,
     ):
         super().__init__()
         if config is None:
@@ -507,7 +614,10 @@ class MiniMaxH3ImageTransformer(nn.Module):
 
         self.refiner_blocks = nn.ModuleList([H3RefinerBlock(cfg) for _ in range(cfg.num_refiner_layers)])
         self.refiner_final_norm_weight = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
-        self.blocks = nn.ModuleList([H3Block(cfg) for _ in range(cfg.num_layers)])
+        if quantization not in (None, "bf16", "fp8_ffn"):
+            raise ValueError(f"quantization={quantization!r}; supported: None/'bf16', 'fp8_ffn'")
+        self.quantization = None if quantization == "bf16" else quantization
+        self.blocks = nn.ModuleList([H3Block(cfg, self.quantization) for _ in range(cfg.num_layers)])
         self.norm_out_weight = nn.Parameter(torch.ones(H, dtype=torch.bfloat16))
 
         # Layout of the packed sequence, set per request by the pipeline (see set_layout).
@@ -669,8 +779,15 @@ class MiniMaxH3ImageTransformer(nn.Module):
             mappings[f"{prefix_model}.attn.norm_q_weight"] = f"{prefix_ckpt}.attn.norm_q.weight"
             mappings[f"{prefix_model}.attn.norm_k_weight"] = f"{prefix_ckpt}.attn.norm_k.weight"
             mappings[f"{prefix_model}.attn.o_weight"] = f"{prefix_ckpt}.attn.to_out.0.weight"
-            mappings[f"{prefix_model}.ff.up_gate_weight"] = f"{prefix_ckpt}.ff.net.0.proj.weight"
-            mappings[f"{prefix_model}.ff.down_weight"] = f"{prefix_ckpt}.ff.net.2.weight"
+            if isinstance(self.get_submodule(f"{prefix_model}.ff"), H3FeedForwardFP8):
+                for n in ("gate", "up"):
+                    mappings[f"{prefix_model}.ff.{n}_w8"] = f"{prefix_ckpt}.ff.net.0.proj.weight"
+                    mappings[f"{prefix_model}.ff.{n}_s"] = f"{prefix_ckpt}.ff.net.0.proj.weight"
+                mappings[f"{prefix_model}.ff.down_w8"] = f"{prefix_ckpt}.ff.net.2.weight"
+                mappings[f"{prefix_model}.ff.down_s"] = f"{prefix_ckpt}.ff.net.2.weight"
+            else:
+                mappings[f"{prefix_model}.ff.up_gate_weight"] = f"{prefix_ckpt}.ff.net.0.proj.weight"
+                mappings[f"{prefix_model}.ff.down_weight"] = f"{prefix_ckpt}.ff.net.2.weight"
 
         for i in range(len(self.refiner_blocks)):
             attn_ff(f"refiner_blocks.{i}", f"token_refiner.refiner_blocks.{i}")

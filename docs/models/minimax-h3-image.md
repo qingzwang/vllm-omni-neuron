@@ -42,7 +42,7 @@ The pipeline reads `transformer_diffusers/`, `vae_diffusers/`, `text_encoder/`,
 | | 1024x1024 to 4096x4096 (`min_generation_area` canvas policy, LANCZOS resize back) | ✅ |
 | | Six-step PDD sampling, no CFG | ✅ |
 | **Precision** | BF16 DiT and text encoder, BF16 VAE decoder (FP32 norms) | ✅ |
-| | FP8 | ❌ Not yet |
+| | FP8 FFN (`quantization: fp8_ffn`, W8A8 ROW) | Experimental |
 | **Parallelism** | Tensor parallelism (TP=8, 7 heads per rank) | ✅ |
 | | Context parallelism over the packed sequence (`ring_degree`) | ✅ |
 | | Tile-parallel VAE decode over all ranks | ✅ |
@@ -158,6 +158,25 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 ~11.7 ms per block, of which ~3.5 ms is the two TP all-reduces (47 MB each), ~6.4 ms the
 projection matmuls (~40% of BF16 peak) and ~1.9 ms attention. Fusing communication and
 elementwise work into the projection kernels is the next optimization step.
+
+## Quantization (experimental)
+
+`model_config.quantization: fp8_ffn` (or `run.py --quantization fp8_ffn`) runs every DiT
+block's SwiGLU FFN as FP8 W8A8 through the nkilib MLP kernel's Trn2 `ROW` mode: weights are
+quantized per output column at load time (e4m3, range +-240), activations per row in the
+graph. The kernel itself is 2.1x faster than the BF16 FFN (190 vs 90 TFLOPS at 4352 tokens),
+but the activation quantization still runs as separate ops, so the end-to-end gain is small
+and image quality drops by ~3 dB PSNR against the reference. It is not the default.
+
+| Config | BF16 | FP8 FFN | FP8 PSNR vs reference |
+|---|---|---|---|
+| 16 cores, 2048x2048 | 2.23 s | 2.33 s | 27.3 dB |
+| 16 cores, 4096x4096 | 11.0 s | 10.9 s | 27.5 dB |
+| 8 cores, 4096x4096 | 16.2 s | 15.1 s | 27.1 dB |
+| 8 cores, 2048x2048 | 3.99 s | 11.9 s (known slow path) | 25.6 dB |
+
+Teacher-forced per-step velocity error with FP8 FFN is 2.8e-2 - 6.4e-2 relative (cosine >=
+0.998), about 2-3x the BF16 error.
 
 ## Known issues and limitations
 
