@@ -488,24 +488,34 @@ class H3RefinerBlock(nn.Module):
         return x
 
 
+def _segment_select(x, segments, base, fn):
+    """Apply ``fn(x, tab)`` per static row segment, selecting rows with ``torch.where``.
+
+    Every row gets exactly the value its own segment's formula gives. Selecting with static
+    row masks keeps the tensor whole: slicing the segments apart and concatenating them back
+    costs ~3 ms per block at 4352 tokens/core (the copies break the compiler's matmul layouts).
+    """
+    if len(segments) == 1:
+        return fn(x, segments[0][2])
+    rows = torch.arange(x.shape[1], device=x.device)[None, :, None] + base
+    out = fn(x, segments[0][2])
+    for start, end, tab in segments[1:]:
+        out = torch.where((rows >= start) & (rows < end), fn(x, tab), out)
+    return out
+
+
 def _segment_modulate(x, scale, shift, segments, base):
     """``x * (1 + scale[tab]) + shift[tab]`` over static row segments.
 
-    ``segments`` is a list of ``(start, end, tab)`` in *global* row coordinates; ``base`` is
-    the global row of ``x[:, 0]``. ``scale``/``shift`` are ``[NUM_TABS, H]``.
+    ``segments`` is a list of ``(start, end, tab)`` in *global* row coordinates covering the
+    rows of ``x``; ``base`` is the global row of ``x[:, 0]``. ``scale``/``shift`` are
+    ``[NUM_TABS, H]``.
     """
-    parts = []
-    for start, end, tab in segments:
-        xs = x[:, start - base : end - base]
-        parts.append(xs * (1.0 + scale[tab]) + shift[tab])
-    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+    return _segment_select(x, segments, base, lambda t, tab: t * (1.0 + scale[tab]) + shift[tab])
 
 
 def _segment_gate(x, gate, segments, base):
-    parts = []
-    for start, end, tab in segments:
-        parts.append(gate[tab] * x[:, start - base : end - base])
-    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+    return _segment_select(x, segments, base, lambda t, tab: gate[tab] * t)
 
 
 AUTO_OVERLAP_MAX_TOKENS = 8704

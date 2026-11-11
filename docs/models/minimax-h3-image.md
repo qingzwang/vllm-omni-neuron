@@ -69,9 +69,12 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
   group's weights passed in as graph inputs (`layers_per_graph`, default 5). This bounds
   compiler-held activations (a single 50-block graph needs ~30 GB of HBM per core at
   4096x4096 on 8 cores) and cuts cold compile time 2-3x.
-- **All-reduce overlap.** Each block's post-attention tail runs in two token chunks when a
-  core holds at most 8704 tokens (`overlap_chunks`, 0 = automatic), so one chunk's TP
-  all-reduce overlaps the other chunk's matmuls.
+- **Row-segment modulation without slicing.** Image and text rows use different AdaLN rows.
+  Each row's modulation and gate are selected with `torch.where` on static row masks rather
+  than by slicing the sequence into segments and concatenating it back; the copies broke
+  the compiler's matmul layouts and cost ~3 ms per block (exact numerics either way).
+  For the same reason the post-attention tail is no longer split into token chunks by
+  default (`overlap_chunks: 1`).
 - **Compiler flags.** `--internal-hlo2tensorizer-options=--hierarchy-splitter=false` is kept
   (as for Wan): without it blocks run ~8% faster, but intermediate precision changes enough
   for the six-step trajectory to drift visibly from the reference.
@@ -148,23 +151,27 @@ trn2.48xlarge, `NEURON_LOGICAL_NC_CONFIG=2`, BF16, warm (compiled) runs, 20-toke
 average of three generations. "Denoise" is six DiT steps; "Request" is the wall time of
 `Omni.generate`.
 
-| Cores | Resolution | Text encode | Denoise (6 steps) | VAE decode | Request | First request (cold compile) |
-|---|---|---|---|---|---|---|
-| 8 | 1024x1024 | 8 ms | 1.01 s | 0.07 s | **1.14 s** | 55 s |
-| 8 | 2048x2048 | 8 ms | 3.27 s | 0.39 s | **3.99 s** | 72 s |
-| 8 | 4096x4096 | 8 ms | 14.8 s | 0.91 s | **16.2 s** | 298 s |
-| 16 | 1024x1024 | 8 ms | 0.62 s | 0.06 s | **0.74 s** | 50 s |
-| 16 | 2048x2048 | 8 ms | 1.91 s | 0.20 s | **2.23 s** | 54 s |
-| 16 | 4096x4096 | 11 ms | 9.91 s | 0.68 s | **11.0 s** | 111 s |
+| Cores | Resolution | Denoise (6 steps) | VAE decode | Request | PSNR vs reference |
+|---|---|---|---|---|---|
+| 8 | 1024x1024 | 0.82 s | 0.05 s | **0.91 s** | 29.0 dB |
+| 8 | 2048x2048 | 2.54 s | 0.24 s | **2.90 s** | 30.5 dB |
+| 8 | 4096x4096 | 13.1 s | 0.97 s | **14.4 s** | 30.1 dB |
+| 16 | 1024x1024 | 0.56 s | 0.04 s | **0.63 s** | 23.4 dB |
+| 16 | 2048x2048 | 1.67 s | 0.18 s | **1.97 s** | 34.3 dB |
+| 16 | 4096x4096 | 7.11 s | 0.61 s | **8.19 s** | 30.4 dB |
+
+Text encoding takes 8-20 ms in every configuration. Cold first requests compile for
+~1-5 minutes (one compiled 5-block graph is reused for all 50 blocks).
 
 **Where the time goes** (device profile of one warm 2048x2048 request on 8 cores, rank 0):
 the device is busy 99% of the request. The DiT block groups take 95% (60 launches of
 53.6 ms), the VAE decode 131 ms, the text encoder 32 ms, and host gaps between launches
 33 ms in total. Inside a block (10.7 ms): the tensor engine computes for 7.6 ms (71%, about
-38% of BF16 peak; the compiled graph reloads weight tiles about once per matmul pass), TP
-all-reduces are exposed for 1.25 ms (12%, the rest overlaps compute), elementwise work with
-the tensor engine idle takes 1.4 ms (13%) and nothing runs for 0.4 ms (4%). Raising
-in-graph matmul efficiency is the main remaining lever.
+38% of BF16 peak), TP all-reduces are exposed for 1.25 ms (12%, the rest overlaps compute),
+elementwise work with the tensor engine idle takes 1.4 ms (13%) and nothing runs for 0.4 ms
+(4%). The same projection matmuls chained alone in one graph run at 124 TFLOPS; most of the
+gap was the segment slicing described above, which was then removed (-18% per block at this
+size, -27% at 4096x4096 on 16 cores).
 
 ## Step cache
 
@@ -188,7 +195,10 @@ reference in parentheses):
 | 8 | 1.11 s (28.2 dB) / **0.84 s** (26.3 dB) | 3.64 s (27.8 dB) / **2.77 s** (26.2 dB) | 16.2 s (30.1 dB) / **12.3 s** (26.8 dB) |
 | 16 | 0.70 s (24.9 dB) / **0.55 s** (23.7 dB) | 2.22 s (34.1 dB) / **1.73 s** (29.3 dB) | 11.0 s (30.8 dB) / **8.35 s** (27.1 dB) |
 
-The cached images are visually indistinguishable from the uncached ones at all sizes.
+The cached images are visually close to the uncached ones, but PSNR against the reference
+drops by 1-5 dB, so the cache is **not recommended** when fidelity matters and is off by
+default. (These numbers predate the row-segment modulation change in the performance table
+above; the relative saving is the same.)
 
 ## Quantization (experimental)
 

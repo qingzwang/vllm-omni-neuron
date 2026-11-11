@@ -161,7 +161,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         )
         # Token chunks of each block's post-attention tail, so TP all-reduces overlap matmuls.
         for block in self.transformer.blocks:
-            block.overlap_chunks = int(overrides.get("overlap_chunks", 0))
+            block.overlap_chunks = int(overrides.get("overlap_chunks", 1))
         vae_dtype = getattr(torch, str(overrides.get("vae_dtype", "bfloat16")))
         self.vae = NeuronMiniMaxH3ImageVAEDecoder(os.path.join(mp, "vae_diffusers"), dtype=vae_dtype)
         self.text_buckets = [int(b) for b in overrides.get("text_buckets", DEFAULT_TEXT_BUCKETS)]
