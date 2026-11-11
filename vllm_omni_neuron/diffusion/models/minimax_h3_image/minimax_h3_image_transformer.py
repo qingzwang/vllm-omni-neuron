@@ -452,6 +452,13 @@ class H3FeedForwardFP8(nn.Module):
     def _dequant(self, w8, s):
         return w8.float() * s[:1]
 
+    def forward_packed(self, packed):
+        """FFN on an already row-quantized ``[B, S, H + 4]`` activation (see adaln_modulate)."""
+        out = _h3_nki_fp8_mlp(packed, self.gate_w8, self.up_w8, self.down_w8, self.gate_s, self.up_s, self.down_s)
+        if self.tp_size > 1:
+            dist.all_reduce(out, group=self.tp_group)
+        return out
+
     def forward(self, x):
         if can_run_kernel(x):
             out = _h3_nki_fp8_mlp(
@@ -533,6 +540,8 @@ class H3Block(nn.Module):
         shift_msa, scale_msa, gate_msa = mod[:, 0], mod[:, 1], mod[:, 2]
         shift_mlp, scale_mlp, gate_mlp = mod[:, 3], mod[:, 4], mod[:, 5]
         h = _segment_modulate(rms_norm(x, self.norm1_weight, self.eps), scale_msa, shift_msa, segments, base)
+        if isinstance(self.ff, H3FeedForwardFP8) and can_run_kernel(x):
+            return self._forward_fused_fp8(x, h, mod, cos, sin, kv_len, segments, base)
         chunks = self.overlap_chunks
         if chunks == 0:  # auto: overlap pays off up to ~8.7k tokens per core (measured on trn2)
             chunks = 2 if x.shape[1] <= AUTO_OVERLAP_MAX_TOKENS else 1
@@ -550,6 +559,39 @@ class H3Block(nn.Module):
             hc = _segment_modulate(rms_norm(xc, self.norm2_weight, self.eps), scale_mlp, shift_mlp, seg, base + c0)
             outs.append(xc + _segment_gate(self.ff(hc), gate_mlp, seg, base + c0))
         return torch.cat(outs, dim=1)
+
+    def _forward_fused_fp8(self, x, h, mod, cos, sin, kv_len, segments, base):
+        chunks = self.overlap_chunks
+        if chunks == 0:
+            chunks = 2 if x.shape[1] <= AUTO_OVERLAP_MAX_TOKENS else 1
+        a = self.attn.attend(h, kv_len, cos, sin)
+        if chunks <= 1:
+            return _fused_tail_fp8(self, x, self.attn.project_out(a), mod, segments, base)
+        outs = []
+        for c0, c1 in _chunk_bounds(x.shape[1], chunks):
+            seg = _clip_segments(segments, base + c0, base + c1)
+            outs.append(_fused_tail_fp8(self, x[:, c0:c1], self.attn.project_out(a[:, c0:c1]), mod, seg, base + c0))
+        return torch.cat(outs, dim=1)
+
+
+def _fused_tail_fp8(block, x, attn_out, mod, segments, base):
+    """Per row segment: one adaln kernel does ``x + gate * attn_out`` -> RMSNorm ->
+    ``* w2 * (1 + scale) + shift`` -> row FP8 pack; then the FP8 FFN and its gated add."""
+    from vllm_omni_neuron.diffusion.quantization.adaln_kernels import adaln_modulate
+
+    res_parts, packed_parts = [], []
+    for start, end, tab in segments:
+        lo, hi = start - base, end - base
+        mul = (block.norm2_weight.float() * (1.0 + mod[tab, 4].float())).to(x.dtype)
+        res, packed = adaln_modulate(
+            attn_out[:, lo:hi], mul, mod[tab, 3], eps=block.eps, norm_type="rms_norm", quant="row",
+            ocp=False, residual=x[:, lo:hi], gate=mod[tab, 2],
+        )
+        res_parts.append(res)
+        packed_parts.append(packed)
+    x = res_parts[0] if len(res_parts) == 1 else torch.cat(res_parts, dim=1)
+    packed = packed_parts[0] if len(packed_parts) == 1 else torch.cat(packed_parts, dim=1)
+    return x + _segment_gate(block.ff.forward_packed(packed), mod[:, 5], segments, base)
 
 
 class _BlockGroup(nn.Module):
