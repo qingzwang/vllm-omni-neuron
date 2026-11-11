@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: Apache-2.0
+"""NeuronMiniMaxH3ImagePipeline — MiniMax-H3-Image text-to-image on Neuron.
+
+Reference: diffusers ``MiniMaxH3ImageModularPipeline`` (``text2image`` blocks). One request
+runs:
+
+1. **Text encoder** — Qwen3-VL text tower, ``hidden_states[50]`` of the verbatim prompt
+   (no chat template, no special tokens, at most 4096 tokens). TP over the TP group.
+2. **Text stream** — ``context_embedder`` + ``token_refiner``, once per request.
+3. **Six PDD steps** — one DiT forward per step (TP x CP over the packed
+   ``[image | text]`` sequence), velocity-form Euler update in fp32 on the host.
+4. **VAE decode** — 256-px tiles batched across all ranks, stitched on rank 0, then the
+   reference's ImageNet de-normalization, 8-bit truncation and LANCZOS resize back to the
+   requested size when the canvas was enlarged to ``min_generation_area``.
+
+The checkpoint is guidance- and step-distilled: there is no CFG, no negative prompt and the
+sigma grid is fixed (``pdd_config.json``).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import time
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from transformers import AutoTokenizer
+from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.utils import get_local_device
+
+from .layout import build_layout, choose_text_pad, get_image_canvas_size, patchify, unpatchify
+from .minimax_h3_image_transformer import (
+    IMAGE_TAG,
+    REFERENCE_NOISE_AUG,
+    TEXT_TAG,
+    MiniMaxH3ImageConfig,
+    MiniMaxH3ImageTimeTables,
+    MiniMaxH3ImageTransformer,
+    build_rope_tables,
+)
+from .qwen3_text_encoder import TEXT_ENCODER_LAYER, NeuronQwen3TextEncoder
+from .vae_decoder import NeuronMiniMaxH3ImageVAEDecoder, plan_tiles, stitch_tiles
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SIZE = 2048
+DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
+MAX_SEQUENCE_LENGTH = 4096
+DEFAULT_TEXT_BUCKETS = (256, 512, 1024, 2048, 4096)
+PIXEL_MEAN = (0.485, 0.456, 0.406)
+PIXEL_STD = (0.229, 0.224, 0.225)
+
+_COMPILER_ARGS = [
+    "--model-type=transformer",
+    "--auto-cast=none",
+    "-O1",
+    "--hbm-scratchpad-page-size=2048",
+    "--internal-hlo2tensorizer-options=--hierarchy-splitter=false",
+]
+
+
+def _resolve_model_path(model: str) -> str:
+    if os.path.isdir(model):
+        return model
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        model,
+        allow_patterns=[
+            "model_index.json", "pdd_config.json", "tokenizer/*", "processor/*", "scheduler/*",
+            "transformer_diffusers/*", "vae_diffusers/*", "text_encoder/*",
+        ],
+    )
+
+
+def _resolve_text_encoder_path(model_path: str) -> str:
+    local = os.path.join(model_path, "text_encoder")
+    if os.path.isfile(os.path.join(local, "config.json")):
+        return local
+    # model_index.json loads the encoder from MiniMaxAI/MiniMax-H3 (subfolder text_encoder).
+    with open(os.path.join(model_path, "model_index.json")) as f:
+        spec = json.load(f).get("text_encoder", [None, None, {}])
+    repo = spec[2].get("pretrained_model_name_or_path", "MiniMaxAI/MiniMax-H3") if len(spec) > 2 else "MiniMaxAI/MiniMax-H3"
+    from huggingface_hub import snapshot_download
+
+    return os.path.join(snapshot_download(repo, allow_patterns=["text_encoder/*"]), "text_encoder")
+
+
+def get_minimax_h3_image_post_process_func(od_config):
+    """``[B, 3, H, W]`` float images in ``[0, 1]`` -> list of PIL images."""
+    from PIL import Image
+
+    def post_process_func(images, output_type: str = "pil", sampling_params=None):
+        if images is None:
+            return images
+        if output_type in ("pt", "latent"):
+            return images
+        arr = (images.float().clamp(0, 1) * 255).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+        if output_type == "np":
+            return arr
+        return [Image.fromarray(a) for a in arr]
+
+    return post_process_func
+
+
+class NeuronMiniMaxH3ImagePipeline(nn.Module):
+    """MiniMax-H3-Image (text-to-image) for Neuron: TP x CP DiT, TP text encoder,
+    tile-parallel VAE decode."""
+
+    def __init__(self, *, od_config, prefix: str = ""):
+        super().__init__()
+        self.od_config = od_config
+        self.device = get_local_device()
+        overrides = dict(od_config.model_config or {})
+        self.model_path = _resolve_model_path(od_config.model)
+        mp = self.model_path
+
+        self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(mp, "tokenizer"))
+        with open(os.path.join(mp, "pdd_config.json")) as f:
+            self.sample_sigmas = [float(s) for s in json.load(f)["sigmas"]]
+        # The released sampler rounds every sigma through its float32 timestep 1 - sigma.
+        self.timesteps = torch.tensor([1.0 - s for s in self.sample_sigmas[:-1]], dtype=torch.float32)
+        self.sigmas = torch.cat([1.0 - self.timesteps, torch.zeros(1, dtype=torch.float32)])
+
+        self.text_encoder = NeuronQwen3TextEncoder(
+            _resolve_text_encoder_path(mp), num_layers=int(overrides.get("text_encoder_layers", TEXT_ENCODER_LAYER))
+        )
+        tr_path = os.path.join(mp, "transformer_diffusers")
+        self.transformer_path = tr_path
+        with open(os.path.join(tr_path, "config.json")) as f:
+            tf_cfg = MiniMaxH3ImageConfig.from_dict(json.load(f))
+        if overrides.get("num_layers") is not None:
+            tf_cfg.num_layers = int(overrides["num_layers"])
+        if tf_cfg.num_pdd_heads != len(self.timesteps):
+            raise ValueError(f"{tf_cfg.num_pdd_heads} PDD heads for {len(self.timesteps)} sampling steps")
+        self.transformer = MiniMaxH3ImageTransformer(
+            tf_cfg, layers_per_graph=int(overrides.get("layers_per_graph", 5))
+        )
+        vae_dtype = getattr(torch, str(overrides.get("vae_dtype", "bfloat16")))
+        self.vae = NeuronMiniMaxH3ImageVAEDecoder(os.path.join(mp, "vae_diffusers"), dtype=vae_dtype)
+        self.text_buckets = [int(b) for b in overrides.get("text_buckets", DEFAULT_TEXT_BUCKETS)]
+
+        sp = get_sp_group()
+        self.cp_size, self.cp_rank = sp.world_size, sp.rank_in_group
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world = dist.get_world_size() if dist.is_initialized() else 1
+        self.is_output_rank = self.rank == 0
+
+        self._te_fn = self.text_encoder.forward
+        self._text_fn = self.transformer.prepare_text
+        self._vae_fn = self.vae.forward
+        self._step_tables: list | None = None
+        self.skip_warmup = True
+        self._last_timings: dict | None = None
+
+    # ------------------------------------------------------------------ setup
+
+    def to(self, *args, **kwargs):
+        for m in (self.text_encoder, self.transformer, self.vae):
+            m.to(*args, **kwargs)
+        return self
+
+    def load_weights(self, weights=None):
+        """Load every component directly to this rank's device (TP-sharded where needed)."""
+        t0 = time.perf_counter()
+        self.text_encoder.load_weights(self.device)
+        self.transformer.load_weights(self.transformer_path, device=self.device)
+        self.vae.load_weights()
+        self.vae.to(self.device)
+        self._build_step_tables()
+        logger.info("MiniMax-H3-Image weights loaded in %.1fs", time.perf_counter() - t0)
+        return None
+
+    @torch.no_grad()
+    def _build_step_tables(self) -> None:
+        """Per step: ``[L, 3, 6, H]`` block modulation, ``[2, H]`` out-norm, PDD head."""
+        cfg = self.transformer.config
+        tables = MiniMaxH3ImageTimeTables(self.transformer_path, cfg)
+        n = len(self.timesteps)
+        all_t = torch.cat([self.timesteps, torch.tensor([REFERENCE_NOISE_AUG], dtype=torch.float32)])
+        blk = tables.block_tables(all_t, list(range(cfg.num_layers)))
+        out = tables.out_table(all_t)
+        steps = []
+        for i in range(n):
+            mods = torch.stack(
+                [torch.stack([blk[l][i, IMAGE_TAG], blk[l][i, TEXT_TAG], blk[l][n, IMAGE_TAG]]) for l in range(cfg.num_layers)]
+            )
+            w, b = tables.head(i)
+            group_mods = [m.to(self.device) for m in self.transformer.split_mods(mods)]
+            steps.append((group_mods, out[i].to(self.device), w.to(self.device), b.to(self.device)))
+        self._step_tables = steps
+
+    def compile(self, *args, **kwargs):
+        backend = kwargs.get("backend")
+        base = dict(kwargs.get("options") or {})
+        fullgraph = kwargs.get("fullgraph", True)
+
+        def comp(fn, name, extra=()):
+            opts = {**base, "model_name": f"minimax_h3_image_{name}", "compiler_args": [*_COMPILER_ARGS, *extra]}
+            return torch.compile(fn, backend=backend, fullgraph=fullgraph, dynamic=False, options=opts)
+
+        self._te_fn = comp(self.text_encoder.forward, "text_encoder")
+        self._text_fn = comp(self.transformer.prepare_text, "text_stream")
+        self.transformer.compile_step(comp)
+        self._vae_fn = comp(self.vae.forward, "vae_decode")
+        return self
+
+    # ------------------------------------------------------------------ request
+
+    @staticmethod
+    def _prompt_of(raw) -> str:
+        if isinstance(raw, str):
+            return raw
+        return raw.get("prompt") or ""
+
+    def _generator(self, sp):
+        gen = getattr(sp, "generator", None)
+        if isinstance(gen, list):
+            gen = gen[0] if gen else None
+        if gen is not None:
+            return gen
+        seed = getattr(sp, "seed", None)
+        g = torch.Generator("cpu")
+        if seed is not None:
+            g.manual_seed(int(seed))
+        return g
+
+    @torch.no_grad()
+    def _generate_one(self, prompt: str, sp) -> torch.Tensor | None:
+        timings = {}
+        t_all = time.perf_counter()
+        extra = dict(getattr(sp, "extra_args", None) or {})
+        out_h = int(getattr(sp, "height", None) or DEFAULT_SIZE)
+        out_w = int(getattr(sp, "width", None) or DEFAULT_SIZE)
+        min_area = int(extra.get("min_generation_area", DEFAULT_MIN_GENERATION_AREA))
+        if not 1024 <= min_area <= 4096 * 4096:
+            raise ValueError(f"min_generation_area must be within [1024, {4096 * 4096}], got {min_area}")
+        height, width = get_image_canvas_size(out_h, out_w, min_area, 32)
+        lh, lw = height // 16, width // 16
+
+        if not prompt:
+            raise ValueError("MiniMax-H3-Image requires a non-empty prompt")
+        token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+        num_text = len(token_ids)
+        n_img = (lh // 2) * (lw // 2)
+        text_pad = choose_text_pad(num_text, n_img, self.cp_size, self.text_buckets)
+        dev = self.device
+
+        # 1. text encoder
+        t0 = time.perf_counter()
+        ids = torch.zeros(1, text_pad, dtype=torch.long)
+        ids[0, :num_text] = torch.tensor(token_ids, dtype=torch.long)
+        emb = self.text_encoder.embed(ids)
+        te_cos, te_sin = self.text_encoder.rope_tables(text_pad)
+        prompt_embeds = self._te_fn(emb.to(dev), te_cos.to(dev), te_sin.to(dev))
+        # 2. text stream (context_embedder + token_refiner)
+        text_kv_len = torch.tensor([num_text], dtype=torch.int32).to(dev)
+        text_hidden = self._text_fn(prompt_embeds, text_kv_len)
+        timings["text_encode_s"] = time.perf_counter() - t0
+
+        # 3. denoise
+        t0 = time.perf_counter()
+        layout = build_layout(num_text, text_pad, [], lh, lw)
+        cfg = self.transformer.config
+        cos, sin = build_rope_tables(layout.position_ids, cfg)
+        local = layout.total // self.cp_size
+        lo = self.cp_rank * local
+        cos_l = cos[lo : lo + local].to(torch.bfloat16).to(dev)
+        sin_l = sin[lo : lo + local].to(torch.bfloat16).to(dev)
+        kv_len = torch.tensor([layout.kv_len], dtype=torch.int32).to(dev)
+        self.transformer.set_layout(0)
+
+        latents_in = getattr(sp, "latents", None)
+        if latents_in is not None:
+            noise = latents_in.to(torch.float32).reshape(1, cfg.in_channels, 1, lh, lw)
+        else:
+            noise = torch.randn((1, cfg.in_channels, 1, lh, lw), generator=self._generator(sp), dtype=torch.float32)
+        latents = patchify(noise[:, :, 0])
+        for i in range(len(self.timesteps)):
+            mods, out_mod, head_w, head_b = self._step_tables[i]
+            v = self.transformer(latents[None].to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b)
+            v = v.cpu()[0, :n_img].float()
+            latents = latents + (self.sigmas[i] - self.sigmas[i + 1]) * v
+        timings["denoise_s"] = time.perf_counter() - t0
+
+        if getattr(sp, "output_type", None) == "latent":
+            return unpatchify(latents, lh, lw) if self.is_output_rank else None
+
+        # 4. VAE decode (tile-parallel)
+        t0 = time.perf_counter()
+        image = self._decode(latents, lh, lw)
+        timings["vae_decode_s"] = time.perf_counter() - t0
+        timings["total_s"] = time.perf_counter() - t_all
+        if not self.is_output_rank:
+            return None
+
+        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
+        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
+        image = (image.float() * ps + pm).clamp(0, 1)
+        # The released pipeline quantizes to 8 bits by truncation, then resizes the 8-bit image.
+        image = (image * 255).clamp(0, 255).to(torch.uint8)
+        if (out_h, out_w) != tuple(image.shape[-2:]):
+            from PIL import Image
+
+            pil = Image.fromarray(image[0].permute(1, 2, 0).numpy()).resize((out_w, out_h), Image.LANCZOS)
+            image = torch.from_numpy(__import__("numpy").array(pil)).permute(2, 0, 1)[None]
+        timings.update(height=height, width=width, text_tokens=num_text, text_pad=text_pad)
+        self._last_timings = timings
+        logger.info("MiniMax-H3-Image request timings: %s", timings)
+        return image.float() / 255.0
+
+    def _decode(self, latents: torch.Tensor, lh: int, lw: int) -> torch.Tensor | None:
+        vae = self.vae
+        z = unpatchify(latents, lh, lw) * vae.latents_std + vae.latents_mean
+        slices, (ny, nx), yo, xo = plan_tiles(lh, lw)
+        n = len(slices)
+        per = math.ceil(n / self.world)
+        th, tw = slices[0][1], slices[0][3]
+        batch = torch.zeros(per, vae.latent_channels, th, tw, dtype=torch.float32)
+        for j, t in enumerate(range(self.rank * per, min(n, (self.rank + 1) * per))):
+            y, hh, x, ww = slices[t]
+            batch[j] = z[0, :, y : y + hh, x : x + ww]
+        cos, sin = vae.rope_tables(th, tw)
+        out = self._vae_fn(batch.to(self.device), cos.to(self.device), sin.to(self.device)).cpu().float()
+        if self.world == 1:
+            tiles = out[:n]
+        else:
+            gathered = [torch.empty_like(out) for _ in range(self.world)] if self.is_output_rank else None
+            dist.gather(out, gathered, dst=0)
+            if not self.is_output_rank:
+                return None
+            tiles = torch.cat(gathered)[:n]
+        grid = [[tiles[i * nx + j : i * nx + j + 1] for j in range(nx)] for i in range(ny)]
+        return stitch_tiles(grid, yo, xo)
+
+    def forward(self, req):
+        if getattr(self, "skip_warmup", False) and list(getattr(req, "request_ids", []) or []) == ["dummy_req_id"]:
+            logger.info("Skipping warmup request on the Neuron MiniMax-H3-Image pipeline")
+            return [DiffusionOutput(output=None) for _ in range(req.num_reqs)]
+        outputs = []
+        for raw, sp in zip(req.prompts, req.sampling_params_list):
+            image = self._generate_one(self._prompt_of(raw), sp)
+            outputs.append(DiffusionOutput(output=image))
+        return outputs
+
+
+PIPELINE_REGISTRY = [
+    {
+        "model_arch": "MiniMaxH3ImagePipeline",
+        "class_name": "NeuronMiniMaxH3ImagePipeline",
+        "post_process_func_name": "get_minimax_h3_image_post_process_func",
+    },
+]
