@@ -196,6 +196,8 @@ def _torch_attention(q, k, v, kv_len):
 # <= ~105 in every block but 3, 36, 45 and 49 (45 and 49: ranges of ~600 and ~13000), which keep
 # the exact online-softmax kernel (CONST_MAX_EXCLUDED_BLOCKS).
 
+HEAD_MAJOR_MIN_ROWS = 6144  # CP-local rows (after the TP all-gather) from which head-major attention is used
+
 CONST_MAX_WINDOW = 60.0
 CONST_MAX_SAMPLE_KEYS = 256
 CONST_MAX_EXCLUDED_BLOCKS = (3, 36, 45, 49)
@@ -408,6 +410,11 @@ class H3Attention(nn.Module):
         self.cp_rank = cp_group.rank_in_group if self.cp_size > 1 else 0
         self.const_max = False  # set per block by MiniMaxH3ImageTransformer.configure_attention
         self.fuse_kv_gather = True
+        self.head_major = False  # set for the DiT blocks by MiniMaxH3ImageTransformer
+        # Head-major pays off only for long sequences (fewer layout transposes around the
+        # attention kernel vs a less efficient batched QKV einsum): measured -2.4% per block
+        # at 8320 rows per CP rank, +7% at 2176.
+        self.head_major_min_rows = HEAD_MAJOR_MIN_ROWS
 
         self.qkv_weight = nn.Parameter(torch.empty(hidden, 3 * local, dtype=torch.bfloat16))
         set_weight_loader(
@@ -425,13 +432,20 @@ class H3Attention(nn.Module):
         return self.project_out(self.attend(x, kv_len, cos, sin))
 
     def project_out(self, out, scatter: bool = False):
-        out = torch.matmul(out, self.o_weight)
+        if out.dim() == 3:  # head-major [N, S, D] (see attend): contract heads and head dim at once
+            n, s_, d = out.shape
+            out = torch.einsum("nsd,ndh->sh", out, self.o_weight.view(n, d, -1))[None]
+        else:
+            out = torch.matmul(out, self.o_weight)
         if self.tp_size > 1:
             out = tp_reduce_scatter_rows(out, self.tp_group, self.tp_size) if scatter else _all_reduce(out, self.tp_group)
         return out
 
     def attend(self, x, kv_len, cos=None, sin=None):
-        """QKV projection, QK norm, RoPE and attention: ``[1, S, local_heads * D]`` (pre-O)."""
+        """QKV projection, QK norm, RoPE and attention: ``[1, S, local_heads * D]`` (pre-O), or
+        ``[local_heads, S, D]`` with ``head_major`` (no layout transposes around the kernel)."""
+        if self.head_major and x.shape[0] == 1 and isinstance(cos, tuple) and x.shape[1] >= self.head_major_min_rows:
+            return self._attend_head_major(x, kv_len, cos)
         qkv = torch.matmul(x, self.qkv_weight)
         q, k, v = qkv.split(self.local_inner, dim=-1)
         q = rms_norm(q.unflatten(-1, (self.num_heads, self.head_dim)), self.norm_q_weight, self.eps)
@@ -453,6 +467,32 @@ class H3Attention(nn.Module):
                 k = self.cp_group.all_gather(k.contiguous(), dim=1)
                 v = self.cp_group.all_gather(v.contiguous(), dim=1)
         return h3_attention(q, k, v, kv_len, self.const_max, self.cp_rank * q.shape[1])
+
+    def _attend_head_major(self, x, kv_len, rope):
+        n, d = self.num_heads, self.head_dim
+        # [S, H] x [H, 3, N, D] -> [3, N, S, D]: per (projection, head) a [S, H] x [H, D] matmul
+        qkv = torch.einsum("sh,hcnd->cnsd", x[0], self.qkv_weight.view(-1, 3, n, d))
+        q = rms_norm(qkv[0], self.norm_q_weight, self.eps)
+        k = rms_norm(qkv[1], self.norm_k_weight, self.eps)
+        v = qkv[2]
+        cos_f, sin_f, perm = rope
+        q = q * cos_f[None] + torch.matmul(q, perm) * sin_f[None]
+        k = k * cos_f[None] + torch.matmul(k, perm) * sin_f[None]
+        sq = q.shape[1]
+        if self.cp_size > 1:
+            # gather [2N, S_local, D] along the sequence: [CP, 2N, S_local, D] -> [2N, CP * S_local, D]
+            kv = torch.cat([k, v], dim=0).contiguous()
+            g = self.cp_group.all_gather(kv[None], dim=0)
+            kv = g.permute(1, 0, 2, 3).reshape(2 * n, -1, d)
+            k, v = kv[:n], kv[n:]
+        k, v = k.contiguous(), v.contiguous()
+        if not can_run_kernel(v):
+            return _torch_attention(q, k, v, kv_len)
+        if self.const_max and k.shape[1] % 128 == 0:
+            out = _h3_nki_const_max(q, k, v, const_max_key_bias(q, k, kv_len, self.cp_rank * sq))
+            q_real = (torch.arange(sq, device=q.device, dtype=torch.int32) + self.cp_rank * sq) < kv_len.reshape(1).to(torch.int32)
+            return torch.where(q_real[None, :, None], out, torch.zeros_like(out))
+        return _h3_nki_attention(q, k, v, kv_len)
 
 
 class H3FeedForward(nn.Module):
@@ -834,6 +874,13 @@ class MiniMaxH3ImageTransformer(nn.Module):
         self.configure_layer_groups(layers_per_graph)
         self.configure_step_cache(())
         self.configure_attention("online")
+
+    def configure_head_major(self, enabled: bool) -> None:
+        """Head-major attention (QKV straight into ``[N, S, D]``, O projection contracting
+        heads): no layout transposes around the attention kernel. Only for the default block
+        path (no token-chunked tail, no FP8 FFN)."""
+        for block in self.blocks:
+            block.attn.head_major = bool(enabled) and block.overlap_chunks == 1 and not isinstance(block.ff, H3FeedForwardFP8)
 
     def configure_attention(self, kind: str = "online", excluded_blocks=CONST_MAX_EXCLUDED_BLOCKS) -> None:
         """``"const_max"``: constant-max attention in every block but ``excluded_blocks``;

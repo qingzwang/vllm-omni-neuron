@@ -113,8 +113,13 @@ def _cat0(parts):
     return torch.cat(list(parts), dim=0)
 
 
+def _is_nhwc(images: torch.Tensor) -> bool:
+    return images.dim() == 4 and images.shape[-1] == 3 and images.shape[1] != 3
+
+
 def get_minimax_h3_image_post_process_func(od_config):
-    """``[B, 3, H, W]`` uint8 images (or float in ``[0, 1]``) -> list of PIL images."""
+    """uint8 ``[B, H, W, 3]`` (what the pipeline returns) or ``[B, 3, H, W]`` images (or float
+    in ``[0, 1]``) -> list of PIL images."""
     from PIL import Image
 
     def post_process_func(images, output_type: str = "pil", sampling_params=None):
@@ -122,13 +127,17 @@ def get_minimax_h3_image_post_process_func(od_config):
             return images
         if output_type == "latent":
             return images
-        if output_type == "pt":
-            return images.float() / 255.0 if images.dtype == torch.uint8 else images
         if not isinstance(images, torch.Tensor):
             images = torch.as_tensor(images)
+        nhwc = _is_nhwc(images)
+        if output_type == "pt":
+            images = images.permute(0, 3, 1, 2) if nhwc else images
+            return images.float() / 255.0 if images.dtype == torch.uint8 else images
         if images.dtype != torch.uint8:
             images = (images.float().clamp(0, 1) * 255).round().to(torch.uint8)
-        arr = images.permute(0, 2, 3, 1).cpu().numpy()
+        # The pipeline already returns contiguous HWC rows: PIL wraps them without a strided
+        # copy (a CHW 4096x4096 image took ~0.24 s to permute here, single-threaded).
+        arr = (images if nhwc else images.permute(0, 2, 3, 1)).cpu().numpy()
         if output_type == "np":
             return arr
         return [Image.fromarray(a) for a in arr]
@@ -185,6 +194,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         # Token chunks of each block's post-attention tail, so TP all-reduces overlap matmuls.
         for block in self.transformer.blocks:
             block.overlap_chunks = int(overrides.get("overlap_chunks", 1))
+        # Head-major attention for long sequences only (see HEAD_MAJOR_MIN_ROWS).
+        self.transformer.configure_head_major(bool(overrides.get("head_major_attention", True)))
         vae_dtype = getattr(torch, str(overrides.get("vae_dtype", "bfloat16")))
         self.vae = NeuronMiniMaxH3ImageVAEDecoder(os.path.join(mp, "vae_diffusers"), dtype=vae_dtype)
         self.text_buckets = [int(b) for b in overrides.get("text_buckets", DEFAULT_TEXT_BUCKETS)]
@@ -718,19 +729,21 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         if not self.is_output_rank:
             return None
 
-        # ``image`` is already the uint8 canvas (de-normalized and truncated on device); the
-        # released pipeline then resizes the 8-bit image.
-        if (out_h, out_w) != tuple(image.shape[-2:]):
+        # ``image`` is the uint8 canvas (de-normalized and truncated like the reference); the
+        # released pipeline then resizes the 8-bit image. Returned as contiguous [1, H, W, 3]
+        # (rank 0 has the threads for the layout change; the engine's PIL conversion does not).
+        image = image.permute(0, 2, 3, 1).contiguous()
+        if (out_h, out_w) != tuple(image.shape[1:3]):
             from PIL import Image
 
-            pil = Image.fromarray(image[0].permute(1, 2, 0).numpy()).resize((out_w, out_h), Image.LANCZOS)
-            image = torch.from_numpy(__import__("numpy").array(pil)).permute(2, 0, 1)[None]
+            pil = Image.fromarray(image[0].numpy()).resize((out_w, out_h), Image.LANCZOS)
+            image = torch.from_numpy(__import__("numpy").array(pil))[None]
         timings["postprocess_s"] = time.perf_counter() - t0 - timings["vae_decode_s"]
         timings["total_s"] = time.perf_counter() - t_all
         timings.update(height=height, width=width, text_tokens=num_text, text_pad=text_pad)
         self._last_timings = timings
         logger.info("MiniMax-H3-Image request timings: %s", timings)
-        # uint8 [1, 3, H, W]: 4x less to ship back to the engine than float.
+        # uint8 [1, H, W, 3]: 4x less to ship back to the engine than float.
         return image.contiguous()
 
     def _broadcast_rank0(self, *tensors):
