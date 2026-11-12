@@ -38,7 +38,7 @@ The pipeline reads `transformer_diffusers/`, `vae_diffusers/`, `text_encoder/`,
 | Category | Feature | Status |
 |---|---|---|
 | **Generation** | Text-to-image | ✅ |
-| | Image editing (reference images) | ❌ Not yet |
+| | Image editing (up to 16 reference images) | ✅ |
 | | 1024x1024 to 4096x4096 (`min_generation_area` canvas policy, LANCZOS resize back) | ✅ |
 | | Six-step PDD sampling, no CFG | ✅ |
 | **Precision** | BF16 DiT and text encoder, BF16 VAE decoder (FP32 norms) | ✅ |
@@ -180,6 +180,35 @@ elementwise work with the tensor engine idle takes 1.4 ms (13%) and nothing runs
 gap was the segment slicing described above, which was then removed (-18% per block at this
 size, -27% at 4096x4096 on 16 cores).
 
+## Image editing
+
+Requests that carry reference images (`multi_modal_data["image"]`, or `run.py --image ref.png`
+repeated for `<Picture 2>`, ...) follow the reference `image_conditioned` pipeline:
+
+- every reference is resized once for the VAE (short edge 1024-2048) and once for the vision
+  tower (short edge 1024);
+- the text encoder sees `Picture i: <vision block>` per reference followed by the prompt; the
+  Qwen3-VL vision tower runs on Neuron (one call per image, patches padded to a 1024 bucket),
+  its embeddings replace the image-pad tokens and its three deepstack features are added after
+  text layers 0-2; 3D MRoPE positions come from the reference `get_rope_index`;
+- the references are VAE-encoded on Neuron (the single-frame causal 3D convolutions are
+  exactly 2D convolutions; 256-pixel tiles spread over all ranks), sampled from the posterior,
+  noised to `t = 0.999` and held at that level for every step;
+- in the DiT the per-row AdaLN table and a row permutation are runtime inputs, so one compiled
+  graph serves every reference/prompt layout of a (canvas, reference bucket, text bucket).
+
+Example from the checkpoint (`examples/reference1.png`, `examples/prompt.edit.txt`, seed 1234,
+2048x2048 canvas, 1459 presentation tokens):
+
+| Cores | Request | Host + vision + VAE encode | Denoise (6 steps) | VAE decode | PSNR vs reference |
+|---|---|---|---|---|---|
+| 8 | **5.09 s** | 0.73 s | 4.02 s | 0.20 s | 36.6 dB |
+| 16 | **4.33 s** | 0.68 s | 3.33 s | 0.15 s | 34.3 dB |
+
+Accuracy per component against the CPU reference: text-row embeddings mean cosine 0.9996
+(vision rows 0.993, the same spread the CPU reference shows against itself across thread
+counts), reference VAE encode rel 3e-7, teacher-forced target velocity rel 1.1-2.2e-2.
+
 ## Step cache
 
 The model samples only six steps, so a dynamic Cache-DiT policy has almost nothing to decide;
@@ -228,8 +257,8 @@ Teacher-forced per-step velocity error with FP8 FFN is 2.8e-2 - 6.4e-2 relative 
 
 ## Known issues and limitations
 
-- **Image editing is not supported yet.** Requests with reference images are rejected;
-  the vision tower of the text encoder and the VAE encoder are not implemented.
+- **Edit buckets.** Reference rows are padded to multiples of 1024 and edit presentations
+  to 2048/4096/8192/16384 tokens; a new bucket compiles new graphs on first use.
 - **Concurrent requests run serially.**
 - **One compiled graph set per (canvas, text bucket).** The first request at a new
   resolution or a prompt longer than the current text bucket compiles new graphs.

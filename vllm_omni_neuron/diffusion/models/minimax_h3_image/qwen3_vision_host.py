@@ -82,12 +82,16 @@ class Qwen3VLVisionHost:
         return cos[0], sin[0]
 
     @torch.no_grad()
-    def presentation_inputs(self, token_ids, mm_token_type_ids, pixel_values, grid_thw, embed_fn, pad_to: int):
-        """inputs_embeds ``[1, pad_to, H]``, deepstack additions ``[3, pad_to, H]``, cos, sin."""
+    def presentation_inputs(self, token_ids, mm_token_type_ids, pixel_values, grid_thw, embed_fn, pad_to: int,
+                            encode_fn=None):
+        """inputs_embeds ``[1, pad_to, H]``, deepstack additions ``[3, pad_to, H]``, cos, sin.
+
+        ``encode_fn(pixel_values, grid_thw) -> (embeds, deepstack list)`` replaces the host
+        vision tower (e.g. the Neuron one)."""
         ids = torch.zeros(1, pad_to, dtype=torch.long)
         ids[0, : len(token_ids)] = torch.tensor(token_ids)
         emb = embed_fn(ids)
-        img, deep = self.encode_images(pixel_values, grid_thw)
+        img, deep = (encode_fn or self.encode_images)(pixel_values, grid_thw)
         mask = ids[0] == self.image_token_id
         mask[len(token_ids):] = False
         if int(mask.sum()) != img.shape[0]:

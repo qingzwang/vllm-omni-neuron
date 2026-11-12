@@ -180,7 +180,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.edit_text_buckets = [int(b) for b in overrides.get("edit_text_buckets", DEFAULT_EDIT_TEXT_BUCKETS)]
         self._te_path = self.text_encoder.model_path
         self._vae_path = os.path.join(mp, "vae_diffusers")
-        self._edit_host = None  # (vision host, VAE encoder, processor), built on first edit (rank 0)
+        self._edit_host = None  # (vision host, device vision, processor), built on first edit (rank 0)
+        self._comp_fn = None
 
         sp = get_sp_group()
         self.cp_size, self.cp_rank = sp.world_size, sp.rank_in_group
@@ -264,6 +265,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self._gather_fn = comp(self._gather_tiles, "vae_gather")
         self._venc_fn = comp(self.vae_encoder.forward, "vae_encode") if hasattr(self, "vae_encoder") else None
         self._venc_comp = comp
+        self._comp_fn = comp
 
         return self
 
@@ -289,10 +291,20 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
 
             from .qwen3_vision_host import Qwen3VLVisionHost
 
+            from .qwen3_vision_neuron import NeuronQwen3VLVision
+
             vision = Qwen3VLVisionHost(self._te_path)
             vision.load_weights()
             proc = AutoProcessor.from_pretrained(os.path.join(self.model_path, "processor"))
-            self._edit_host = (vision, None, proc)
+            dev_vision = None
+            if self.device.type != "cpu":
+                # A separate copy for the device; the host copy keeps the grid-dependent setup.
+                host2 = Qwen3VLVisionHost(self._te_path)
+                host2.load_weights()
+                dev_vision = NeuronQwen3VLVision(host2.vision).to(self.device)
+                fwd = dev_vision.forward
+                dev_vision = (dev_vision, self._comp_fn(fwd, "vision_tower") if self._comp_fn else fwd)
+            self._edit_host = (vision, dev_vision, proc)
         return self._edit_host
 
     def _edit_inputs(self, prompt: str, images, sp, lh: int, lw: int) -> dict:
@@ -403,7 +415,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
         from .vae_encoder import MiniMaxH3ImageVAEEncoder
 
-        vision, _, proc = self._edit_host_models()
+        vision, dev_vision, proc = self._edit_host_models()
         # presentation: "Picture i: " + vision block per reference, then the prompt (no template)
         tok = self.tokenizer
         vin = proc.image_processor(images=vis_imgs, return_tensors="pt")
@@ -441,8 +453,30 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         rows = torch.zeros(ref_pad, ref_rows.shape[1], dtype=torch.float32)
         rows[:n_ref] = ref_rows
         mm = proc.create_mm_token_type_ids([token_ids])[0]
+        encode_fn = None
+        if dev_vision is not None:
+            from .qwen3_vision_neuron import vision_bucket, vision_host_prep
+
+            model, fn = dev_vision
+
+            def encode_fn(pixel_values, grid_thw):
+                """One device call per image (patches padded to a bucket); concatenated outputs."""
+                per_image, start = [], 0
+                for g in grid_thw:
+                    n = int(g.prod())
+                    pv = pixel_values[start : start + n]
+                    start += n
+                    (patches, pos, c, s_), n_real = vision_host_prep(vision.vision, pv, g[None], vision_bucket(n))
+                    kv = torch.tensor([n_real], dtype=torch.int32)
+                    outs = fn(*(t.to(self.device) for t in (patches, pos, c, s_, kv)))
+                    per_image.append([o.cpu()[: n_real // 4] for o in outs])
+                embeds = torch.cat([o[0] for o in per_image])
+                deep = [torch.cat([o[k] for o in per_image]) for k in range(1, len(per_image[0]))]
+                return embeds, deep
+
         emb, ds, cos, sin = vision.presentation_inputs(
-            token_ids, mm, vin["pixel_values"], vin["image_grid_thw"], self.text_encoder.embed, text_pad)
+            token_ids, mm, vin["pixel_values"], vin["image_grid_thw"], self.text_encoder.embed, text_pad,
+            encode_fn=encode_fn)
         return dict(num_text=len(token_ids), text_pad=text_pad, token_tags=tags,
                     grids=[tuple(int(v) for v in r.shape[-2:]) for r in ref_latents], ref_pad=ref_pad,
                     emb=emb, deepstack=ds, cos=cos, sin=sin, noise=noise, ref_rows=rows)
