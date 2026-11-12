@@ -180,6 +180,37 @@ elementwise work with the tensor engine idle takes 1.4 ms (13%) and nothing runs
 gap was the segment slicing described above, which was then removed (-18% per block at this
 size, -27% at 4096x4096 on 16 cores).
 
+### Comparison with 2x H100
+
+Same request as the H100 GPU benchmark (`benchmarks/minimax_h3_image_h100` on the
+`minimax-h3-image-h100-gpu-benchmark` branch: official 313-token sample prompt, seed 42,
+median of 5 warm runs). Neuron: `Omni.generate` wall time ("request") and the pipeline's own
+time ("pipeline", the counterpart of the GPU benchmark's server-side compute; the GPU client
+end-to-end additionally includes PNG + base64 + HTTP, 0.3-1.0 s).
+
+| Case | Neuron 8 cores (pipeline / request) | Neuron 16 cores (pipeline / request) | H100x2 vLLM-Omni TP2 (server) | H100x2 SGLang Ulysses2 (server) |
+|---|---|---|---|---|
+| 1024x1024, native 1024 canvas | 0.84 / 0.86 s | 0.56 / 0.58 s | 0.55 s | 0.34 s |
+| 1024x1024, default 2048 canvas | 2.63 / 2.66 s | 1.64 / 1.66 s | 1.37 s | 1.22 s |
+| 2048x2048 | 2.53 / 2.61 s | 1.54 / 1.62 s | 1.38 s | 1.07 s |
+| 4096x4096 | 13.89 / 14.18 s | 7.04 / 7.31 s | 6.12 s | 5.28 s |
+
+4096x4096 by stage:
+
+| Stage | Neuron 8 cores | Neuron 16 cores | H100x2 vLLM-Omni TP2 | H100x2 SGLang Ulysses2 |
+|---|---|---|---|---|
+| Text encoder | 12 ms | 12 ms | 68 ms | 77 ms |
+| DiT, 6 steps | 13.10 s (2.18 s/step) | 6.52 s (1.09 s/step) | 5.30 s (0.88 s/step) | 4.95 s (0.83 s/step) |
+| VAE decode (+8-bit, to host) | 0.82 s | 0.50 s | 0.59 s | 0.28 s |
+| DiT MFU (BF16 dense peak) | 36% of 1.33 PFLOPS | 36% of 2.67 PFLOPS | ~60% of 1.98 PFLOPS | ~63% of 1.98 PFLOPS |
+
+16 Neuron cores (4 Trainium2 chips) have ~1.35x the BF16 peak of two H100s but split the DiT
+16 ways (TP8 x CP2) instead of 2. The gap is the DiT's efficiency: every collective
+compiles to a blocking step (all engines wait on it), so the 16-way communication is fully
+exposed (~25% of a block at 4096x4096; with collectives replaced by no-ops a block takes
+15.4 instead of 20.6 ms, which would put the 6 steps at ~4.9 s), and the projection matmuls
+reach ~57% of peak while the tensor engine is busy.
+
 ### Single-instance throughput
 
 For serving many requests, one trn2.48xlarge can hold several independent copies of the
