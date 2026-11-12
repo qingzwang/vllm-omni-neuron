@@ -214,8 +214,20 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.vae.load_weights()
         self.vae.to(self.device)
         self._build_step_tables()
+        self._build_vae_encoder()
         logger.info("MiniMax-H3-Image weights loaded in %.1fs", time.perf_counter() - t0)
         return None
+
+    def _build_vae_encoder(self) -> None:
+        """2D (single-frame) form of the reference encoder on this rank's device."""
+        from .vae_encoder import MiniMaxH3ImageVAEEncoder, VAEEncoder2d
+
+        enc = MiniMaxH3ImageVAEEncoder(self._vae_path)
+        enc.load_weights()
+        # fp32 like the reference encoder (the loader may run under a bf16 default dtype)
+        self.vae_encoder = VAEEncoder2d(enc).float().eval().to(self.device)
+        self._vae_latents_mean, self._vae_latents_std = enc.latents_mean, enc.latents_std
+        self._venc_fn = getattr(self, "_venc_fn", None) or self.vae_encoder.forward
 
     @torch.no_grad()
     def _build_step_tables(self) -> None:
@@ -250,6 +262,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.transformer.compile_step(comp)
         self._vae_fn = comp(self.vae.forward, "vae_decode")
         self._gather_fn = comp(self._gather_tiles, "vae_gather")
+        self._venc_fn = comp(self.vae_encoder.forward, "vae_encode") if hasattr(self, "vae_encoder") else None
+        self._venc_comp = comp
 
         return self
 
@@ -274,27 +288,25 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             from transformers import AutoProcessor
 
             from .qwen3_vision_host import Qwen3VLVisionHost
-            from .vae_encoder import MiniMaxH3ImageVAEEncoder
 
             vision = Qwen3VLVisionHost(self._te_path)
             vision.load_weights()
-            enc = MiniMaxH3ImageVAEEncoder(self._vae_path)
-            enc.load_weights()
-            enc.eval()
             proc = AutoProcessor.from_pretrained(os.path.join(self.model_path, "processor"))
-            self._edit_host = (vision, enc, proc)
+            self._edit_host = (vision, None, proc)
         return self._edit_host
 
     def _edit_inputs(self, prompt: str, images, sp, lh: int, lw: int) -> dict:
         """Host side of an edit, computed on rank 0 and broadcast (reference order of RNG draws:
         one posterior sample per reference, then the target noise, then the reference noise)."""
         cfg = self.transformer.config
+        ref_imgs, vis_imgs = self._edit_resize(images)
+        moments = self._encode_references(ref_imgs)  # rank 0: per-reference posterior moments
         meta = [None]
         if self.rank == 0:
             prev = torch.get_num_threads()
             torch.set_num_threads(HOST_POSTPROCESS_THREADS)
             try:
-                payload = self._edit_inputs_rank0(prompt, images, sp, lh, lw)
+                payload = self._edit_inputs_rank0(prompt, ref_imgs, vis_imgs, moments, sp, lh, lw)
             finally:
                 torch.set_num_threads(prev)
             meta[0] = {k: v for k, v in payload.items() if not isinstance(v, torch.Tensor)}
@@ -311,16 +323,13 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         del cfg
         return payload
 
-    def _edit_inputs_rank0(self, prompt, images, sp, lh, lw) -> dict:
-        import numpy as np
+    def _edit_resize(self, images):
+        """Every rank: references upright in RGB, resized for the VAE and for the vision tower."""
         from diffusers.image_processor import VaeImageProcessor
         from PIL import Image, ImageOps
 
-        from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
-
         if len(images) > MAX_REFERENCES:
             raise ValueError(f"MiniMax-H3-Image accepts at most {MAX_REFERENCES} reference images, got {len(images)}")
-        vision, enc, proc = self._edit_host_models()
         ip = VaeImageProcessor(vae_scale_factor=16, do_normalize=False)
         pil = []
         for im in images:
@@ -342,6 +351,59 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
 
         ref_imgs = [bound(im, *REFERENCE_SHORT_EDGE) for im in pil]
         vis_imgs = [bound(im, *VISION_SHORT_EDGE) for im in pil]
+        return ref_imgs, vis_imgs
+
+    def _encode_references(self, ref_imgs):
+        """Tile-parallel reference encode on every rank; returns the stitched posterior
+        moments of each reference on rank 0 (None elsewhere)."""
+        import numpy as np
+
+        from .vae_decoder import stitch_tiles
+        from .vae_encoder import tile_plan
+
+        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
+        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
+        tiles, plans = [], []
+        for im in ref_imgs:
+            px = torch.from_numpy(np.array(im)).permute(2, 0, 1)[None]
+            px = px[..., : px.shape[-2] // 16 * 16, : px.shape[-1] // 16 * 16]
+            px = (px.float().div(255.0) - pm) / ps
+            sl, grid, yo, xo = tile_plan(px.shape[-2], px.shape[-1])
+            if len({(h, w) for _, h, _, w in sl}) != 1 or sl[0][1] != 256 or sl[0][3] != 256:
+                raise ValueError(f"reference of {tuple(px.shape[-2:])} pixels does not tile into 256x256 tiles")
+            plans.append((len(tiles), len(sl), grid, yo, xo))
+            tiles += [px[0, :, i : i + h, j : j + w] for i, h, j, w in sl]
+        n = len(tiles)
+        per = 1 << max(0, math.ceil(math.log2(math.ceil(n / self.world))))  # power-of-two batch buckets
+        slot = self.cp_rank * self.tp_size + self.tp_rank if self.world == self.tp_size * self.cp_size else self.rank
+        batch = torch.zeros(per, 3, 256, 256, dtype=torch.float32)
+        for j, t in enumerate(range(slot * per, min(n, (slot + 1) * per))):
+            batch[j] = tiles[t]
+        out = self._venc_fn(batch.to(self.device))
+        if self.world == self.tp_size * self.cp_size and self.world > 1:
+            all_tiles = self._gather_fn(out)
+        else:
+            host = out.cpu()
+            gathered = [torch.empty_like(host) for _ in range(self.world)] if self.is_output_rank else None
+            if self.world > 1:
+                dist.gather(host, gathered, dst=0)
+                all_tiles = torch.cat(gathered) if self.is_output_rank else None
+            else:
+                all_tiles = host
+        if self.rank != 0:
+            return None
+        all_tiles = all_tiles.cpu().float()
+        moments = []
+        for start, cnt, (ny, nx), yo, xo in plans:
+            t = all_tiles[start : start + cnt]
+            moments.append(stitch_tiles([[t[a * nx + b : a * nx + b + 1] for b in range(nx)] for a in range(ny)], yo, xo))
+        return moments
+
+    def _edit_inputs_rank0(self, prompt, ref_imgs, vis_imgs, moments, sp, lh, lw) -> dict:
+        from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
+        from .vae_encoder import MiniMaxH3ImageVAEEncoder
+
+        vision, _, proc = self._edit_host_models()
         # presentation: "Picture i: " + vision block per reference, then the prompt (no template)
         tok = self.tokenizer
         vin = proc.image_processor(images=vis_imgs, return_tensors="pt")
@@ -358,18 +420,13 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         token_ids += pids
         tags += [_TXT] * len(pids)
 
-        # VAE encode: posterior sample (generator), fp16 round, crop to whole patches, normalize
+        # posterior sample (generator), fp16 round, crop to whole patches, normalize
         gen = self._generator(sp)
         ref_latents = []
-        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
-        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
-        for im in ref_imgs:
-            px = torch.from_numpy(np.array(im)).permute(2, 0, 1)[None]
-            px = px[..., : px.shape[-2] // 16 * 16, : px.shape[-1] // 16 * 16]
-            px = (px.float().div(255.0) - pm) / ps
-            lat = enc.sample(enc.encode_moments(px), gen).to(torch.float16).float()
+        for mom in moments:
+            lat = MiniMaxH3ImageVAEEncoder.sample(mom, gen).to(torch.float16).float()
             lat = lat[..., : lat.shape[-2] // 2 * 2, : lat.shape[-1] // 2 * 2]
-            ref_latents.append((lat - enc.latents_mean) / enc.latents_std)
+            ref_latents.append((lat - self._vae_latents_mean) / self._vae_latents_std)
         noise = torch.randn((1, self.transformer.config.in_channels, 1, lh, lw), generator=gen, dtype=torch.float32)
         ref_rows = []
         for lat in ref_latents:

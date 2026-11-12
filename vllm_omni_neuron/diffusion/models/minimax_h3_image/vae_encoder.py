@@ -157,3 +157,96 @@ class MiniMaxH3ImageVAEEncoder(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn(mean.shape, generator=generator, dtype=mean.dtype)
         return mean + std * eps
+
+
+# ---------------------------------------------------------------------------
+# 2D form for Neuron: a single frame only ever meets the causal conv's two zero
+# padding frames, so every CausalConv3d is exactly a Conv2d with the kernel's last
+# temporal slice (the temporally strided downsamplers included: their one output frame
+# reads [0, 0, x]). Group norms per frame become plain 2D group norms.
+# ---------------------------------------------------------------------------
+
+
+class _Conv2dFrom3d(nn.Module):
+    def __init__(self, conv3d: nn.Conv3d, spatial_padding: int, mode: str, stride: int, pre_pad: bool = False):
+        super().__init__()
+        self.weight = nn.Parameter(conv3d.weight.detach()[:, :, -1].clone(), requires_grad=False)
+        self.bias = nn.Parameter(conv3d.bias.detach().clone(), requires_grad=False)
+        self.p, self.mode, self.stride, self.pre_pad = spatial_padding, mode, stride, pre_pad
+
+    def forward(self, x):
+        if self.pre_pad:  # Downsample: asymmetric bottom/right pad before a stride-2 conv
+            x = _reflect_pad(x, 0, 1) if self.mode == "reflect" else F.pad(x, (0, 1, 0, 1), mode=self.mode)
+        if self.p:
+            x = _reflect_pad(x, self.p, self.p) if self.mode == "reflect" else F.pad(x, (self.p,) * 4, mode=self.mode)
+        return F.conv2d(x, self.weight, self.bias, stride=self.stride)
+
+
+def _reflect_pad(x, before: int, after: int):
+    """``F.pad(..., mode="reflect")`` on H and W (pads <= 1), as slices + concatenation."""
+    def pad_dim(t, dim):
+        parts = []
+        if before:
+            parts.append(t.narrow(dim, 1, 1))
+        parts.append(t)
+        if after:
+            parts.append(t.narrow(dim, t.shape[dim] - 2, 1))
+        return torch.cat(parts, dim=dim)
+
+    if before > 1 or after > 1:
+        raise ValueError("reflect padding > 1 is not used by this encoder")
+    return pad_dim(pad_dim(x, 2), 3)
+
+
+class _Res2d(nn.Module):
+    def __init__(self, r: ResnetBlock, mode: str):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(r.norm1.num_groups, r.norm1.num_channels, eps=r.norm1.eps)
+        self.norm1.load_state_dict(r.norm1.state_dict())
+        self.norm2 = nn.GroupNorm(r.norm2.num_groups, r.norm2.num_channels, eps=r.norm2.eps)
+        self.norm2.load_state_dict(r.norm2.state_dict())
+        self.conv1 = _Conv2dFrom3d(r.conv1, 1, mode, 1)
+        self.conv2 = _Conv2dFrom3d(r.conv2, 1, mode, 1)
+        self.short = _Conv2dFrom3d(r.conv_shortcut, 0, mode, 1) if r.conv_shortcut is not None else None
+
+    def forward(self, x):
+        h = self.conv2(F.silu(self.norm2(self.conv1(F.silu(self.norm1(x))))))
+        return (self.short(x) if self.short is not None else x) + h
+
+
+class VAEEncoder2d(nn.Module):
+    """``[B, 3, th, tw]`` normalized pixel tiles -> ``[B, 2C, th/16, tw/16]`` moments."""
+
+    def __init__(self, enc: MiniMaxH3ImageVAEEncoder):
+        super().__init__()
+        e, mode = enc.encoder, enc.cfg["spatial_padding_mode"]
+        self.conv_in = _Conv2dFrom3d(e.conv_in, 1, mode, 1)
+        layers = []
+        for blk in e.down_blocks:
+            layers += [_Res2d(r, mode) for r in blk.resnets]
+            if blk.downsamplers is not None:
+                d = blk.downsamplers[0]
+                layers.append(_Conv2dFrom3d(d.conv, 0, mode, d.s_stride, pre_pad=d.s_stride == 2))
+        self.layers = nn.ModuleList(layers)
+        self.norm_out = nn.GroupNorm(e.norm_out.num_groups, e.norm_out.num_channels, eps=e.norm_out.eps)
+        self.norm_out.load_state_dict(e.norm_out.state_dict())
+        self.conv_out = _Conv2dFrom3d(e.conv_out, 1, mode, 1)
+        q = enc.quant_conv
+        self.q_weight = nn.Parameter(q.weight.detach()[:, :, 0, 0, 0].clone(), requires_grad=False)
+        self.q_bias = nn.Parameter(q.bias.detach().clone(), requires_grad=False)
+
+    def forward(self, x):
+        x = self.conv_in(x.float())
+        for layer in self.layers:
+            x = layer(x)
+        x = self.conv_out(F.silu(self.norm_out(x)))
+        return torch.einsum("oc,bchw->bohw", self.q_weight, x) + self.q_bias[None, :, None, None]
+
+
+def tile_plan(height: int, width: int, ratio: int = 16):
+    """Pixel tile slices and latent overlaps of the released tiled encode."""
+    T, O = MiniMaxH3ImageVAEEncoder.TILE, MiniMaxH3ImageVAEEncoder.OVERLAP
+    ys, yl, yo = split_tiles(height, T, O, ratio)
+    xs, xl, xo = split_tiles(width, T, O, ratio)
+    slices = [(i, h, j, w) for i, h in zip(ys, yl) for j, w in zip(xs, xl)]
+    return slices, (len(ys), len(xs)), [o // ratio for o in yo], [o // ratio for o in xo]
