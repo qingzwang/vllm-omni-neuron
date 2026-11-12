@@ -196,6 +196,44 @@ def _torch_attention(q, k, v, kv_len):
 # <= ~105 in every block but 3, 36, 45 and 49 (45 and 49: ranges of ~600 and ~13000), which keep
 # the exact online-softmax kernel (CONST_MAX_EXCLUDED_BLOCKS).
 
+# ------------------------------------------------------------------ FGCC (see fgcc_kernels.py)
+# In-kernel collective + matmul for the sequence-parallel block: the out-projection and the FFN
+# down projection (matmul + TP reduce-scatter) always, Q/K/V (TP all-gather + matmul) from
+# FGCC_QKV_MIN_ROWS gathered rows per CP rank (below it the graph path is as fast).
+FGCC_QKV_MIN_ROWS = 6144
+_FGCC_OPS: dict = {}
+
+
+def _fgcc_op(kind: str, groups, tp: int, **kw):
+    key = (kind, groups, tp, tuple(sorted(kw.items())))
+    if key not in _FGCC_OPS:
+        from .fgcc_kernels import agmm_kernel, mmrs_kernel
+
+        tag = "_".join(f"{k}{v}" for k, v in sorted(kw.items()))
+        name = f"minimax_h3_image::fgcc_{kind}_tp{tp}_g{abs(hash(groups)) % 100000}_{tag}"
+        if kind == "ag":
+            @nki_op(name)
+            def op(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+                return wrap_nki_kernel(agmm_kernel, supported_lnc=(2,))(
+                    x, w, groups, tp, 0, kw["row_chunk"], kw["first_chunk"], kw["swiglu"])
+        else:
+            @nki_op(name)
+            def op(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+                return wrap_nki_kernel(mmrs_kernel, supported_lnc=(2,))(a, w, groups, tp, 0, kw["row_chunk"])
+        _FGCC_OPS[key] = op
+    return _FGCC_OPS[key]
+
+
+def fgcc_allgather_matmul(x, w, groups, tp: int):
+    """``[m, K]`` this rank's rows -> ``[tp*m, N]`` (all-gathered rows @ ``w``)."""
+    return _fgcc_op("ag", groups, tp, row_chunk=256, first_chunk=64, swiglu=0)(x, w)
+
+
+def fgcc_matmul_reduce_scatter(a, w, groups, tp: int):
+    """``[tp*m, Kl]`` all rows -> ``[m, H]`` this rank's rows of the TP sum of ``a @ w``."""
+    return _fgcc_op("rs", groups, tp, row_chunk=128)(a, w)
+
+
 HEAD_MAJOR_MIN_ROWS = 6144  # CP-local rows (after the TP all-gather) from which head-major attention is used
 
 CONST_MAX_WINDOW = 60.0
@@ -441,12 +479,14 @@ class H3Attention(nn.Module):
             out = tp_reduce_scatter_rows(out, self.tp_group, self.tp_size) if scatter else _all_reduce(out, self.tp_group)
         return out
 
-    def attend(self, x, kv_len, cos=None, sin=None):
+    def attend(self, x, kv_len, cos=None, sin=None, qkv=None):
         """QKV projection, QK norm, RoPE and attention: ``[1, S, local_heads * D]`` (pre-O), or
-        ``[local_heads, S, D]`` with ``head_major`` (no layout transposes around the kernel)."""
-        if self.head_major and x.shape[0] == 1 and isinstance(cos, tuple) and x.shape[1] >= self.head_major_min_rows:
+        ``[local_heads, S, D]`` with ``head_major`` (no layout transposes around the kernel).
+        ``qkv``: the projection already computed (FGCC all-gather + matmul)."""
+        if qkv is None and self.head_major and x.shape[0] == 1 and isinstance(cos, tuple) and x.shape[1] >= self.head_major_min_rows:
             return self._attend_head_major(x, kv_len, cos)
-        qkv = torch.matmul(x, self.qkv_weight)
+        if qkv is None:
+            qkv = torch.matmul(x, self.qkv_weight)
         q, k, v = qkv.split(self.local_inner, dim=-1)
         q = rms_norm(q.unflatten(-1, (self.num_heads, self.head_dim)), self.norm_q_weight, self.eps)
         k = rms_norm(k.unflatten(-1, (self.num_heads, self.head_dim)), self.norm_k_weight, self.eps)
@@ -512,10 +552,14 @@ class H3FeedForward(nn.Module):
         self.down_weight = nn.Parameter(torch.empty(self.shard, hidden, dtype=torch.bfloat16))
         set_weight_loader(self.down_weight, _row_weight_loader(self.shard, tp_size))
 
-    def forward(self, x, scatter: bool = False):
+    def act(self, x):
+        """``value * silu(gate)`` of the column-parallel up/gate projection (pre-down)."""
         h = torch.matmul(x, self.up_gate_weight)
         value, gate = h.split(self.shard, dim=-1)
-        out = torch.matmul(value * F.silu(gate), self.down_weight)
+        return value * F.silu(gate)
+
+    def forward(self, x, scatter: bool = False):
+        out = torch.matmul(self.act(x), self.down_weight)
         if self.tp_size > 1:
             out = tp_reduce_scatter_rows(out, self.tp_group, self.tp_size) if scatter else _all_reduce(out, self.tp_group)
         return out
@@ -713,6 +757,11 @@ class H3Block(nn.Module):
         # Megatron-style sequence parallelism inside the TP group: between the projections the
         # residual stream holds only this TP rank's 1/tp of the rows (set by the model).
         self.sequence_parallel = False
+        # FGCC kernels for the sequence-parallel projections (set by configure_fgcc)
+        self.fgcc = False
+        self.fgcc_groups = None
+        self.fgcc_qkv_min_rows = FGCC_QKV_MIN_ROWS
+        self.fgcc_qkv = True
 
     def forward(self, x, mod, cos, sin, kv_len, segments, base):
         # mod: [NUM_TABS, 6, H] in diffusers order shift/scale/gate (msa), shift/scale/gate (mlp)
@@ -723,10 +772,24 @@ class H3Block(nn.Module):
             # x / h are this TP rank's rows; gather for the column-parallel projections and
             # reduce-scatter their row-parallel outputs back (same bytes as an all-reduce).
             tp = self.attn.tp_size
-            a = self.attn.attend(tp_all_gather_rows(h, self.attn.tp_group, tp), kv_len, cos, sin)
-            x = x + _segment_gate(self.attn.project_out(a, scatter=True), gate_msa, segments, base)
+            fg = self.fgcc_groups if (self.fgcc and h.shape[0] == 1 and can_run_kernel(h)) else None
+            if fg is not None and self.fgcc_qkv and h.shape[1] * tp >= self.fgcc_qkv_min_rows:
+                qkv = fgcc_allgather_matmul(h[0], self.attn.qkv_weight, fg, tp)[None]
+                a = self.attn.attend(None, kv_len, cos, sin, qkv=qkv)
+            else:
+                a = self.attn.attend(tp_all_gather_rows(h, self.attn.tp_group, tp), kv_len, cos, sin)
+            if fg is not None and a.dim() == 3:
+                # token-major [1, M, Kl] or head-major [N, M, D] attention output
+                o = fgcc_matmul_reduce_scatter(a[0] if a.shape[0] == 1 else a, self.attn.o_weight, fg, tp)[None]
+            else:
+                o = self.attn.project_out(a, scatter=True)
+            x = x + _segment_gate(o, gate_msa, segments, base)
             h = _segment_modulate(rms_norm(x, self.norm2_weight, self.eps), scale_mlp, shift_mlp, segments, base)
-            f = self.ff(tp_all_gather_rows(h, self.attn.tp_group, tp), scatter=True)
+            hg = tp_all_gather_rows(h, self.attn.tp_group, tp)
+            if fg is not None and isinstance(self.ff, H3FeedForward):
+                f = fgcc_matmul_reduce_scatter(self.ff.act(hg)[0], self.ff.down_weight, fg, tp)[None]
+            else:
+                f = self.ff(hg, scatter=True)
             return x + _segment_gate(f, gate_mlp, segments, base)
         if isinstance(self.ff, H3FeedForwardFP8) and can_run_kernel(x):
             return self._forward_fused_fp8(x, h, mod, cos, sin, kv_len, segments, base)
@@ -874,6 +937,28 @@ class MiniMaxH3ImageTransformer(nn.Module):
         self.configure_layer_groups(layers_per_graph)
         self.configure_step_cache(())
         self.configure_attention("online")
+
+    def configure_fgcc(self, enabled: bool, qkv_min_rows: int = FGCC_QKV_MIN_ROWS, qkv: bool = True) -> None:
+        """In-kernel collective + matmul for the sequence-parallel projections (Trn2, LNC=2):
+        out-projection / FFN down (matmul + reduce-scatter), and Q/K/V (all-gather + matmul)
+        from ``qkv_min_rows`` gathered rows per CP rank. Head-major attention is turned off:
+        its Q/K/V einsum replaces the projection the kernel computes."""
+        from vllm_omni_neuron.diffusion.distributed.parallel_state import get_replica_groups
+
+        on = bool(enabled) and self.sequence_parallel and self.quantization is None and \
+            os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2") == "2"
+        groups = get_replica_groups(self.tp_size, self.cp_size)[0] if on else None
+        for block in self.blocks:
+            block.fgcc = on
+            block.fgcc_groups = groups
+            block.fgcc_qkv_min_rows = int(qkv_min_rows)
+            block.fgcc_qkv = bool(qkv)
+        if on and qkv:  # the head-major Q/K/V einsum would replace the projection the kernel does
+            self.configure_head_major(False)
+        if on:  # register the kernel ops now: the graphs that call them cannot trace a registration
+            _fgcc_op("ag", groups, self.tp_size, row_chunk=256, first_chunk=64, swiglu=0)
+            _fgcc_op("rs", groups, self.tp_size, row_chunk=128)
+        self.fgcc_enabled = on
 
     def configure_head_major(self, enabled: bool) -> None:
         """Head-major attention (QKV straight into ``[N, S, D]``, O projection contracting

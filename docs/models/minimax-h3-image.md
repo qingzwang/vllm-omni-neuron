@@ -180,6 +180,24 @@ elementwise work with the tensor engine idle takes 1.4 ms (13%) and nothing runs
 gap was the segment slicing described above, which was then removed (-18% per block at this
 size, -27% at 4096x4096 on 16 cores).
 
+### Collective overlap (FGCC kernels)
+
+On Trn2 every collective the compiler emits is a blocking step for all engines (no overlap
+with independent compute). The sequence-parallel block therefore runs the out-projection and
+the FFN down projection as NKI kernels that do the matmul and the TP reduce-scatter together,
+chunked so that each chunk's in-kernel reduce-scatter overlaps the next chunk's matmuls
+(`fgcc_kernels.py`, `mmrs_kernel`; bit-identical to the compiler path). An all-gather + matmul
+kernel (`agmm_kernel`) for Q/K/V is available via `model_config.fgcc_qkv` (with head-major
+attention it is slightly slower). In-kernel collectives under LNC=2 must use one `shared_hbm`
+buffer per collective with each core writing its own slice, and the live (physical-mesh) TP
+replica groups.
+
+| 16 cores | 2048x2048 block | 4096x4096 block |
+|---|---|---|
+| compiler path | 4.50 ms | 21.10 ms |
+| + head-major attention | 4.50 ms | 20.48 ms |
+| + FGCC out-projection / FFN down (default) | 4.48 ms | **19.58 ms** |
+
 ### Comparison with 2x H100
 
 Same request as the H100 GPU benchmark (`benchmarks/minimax_h3_image_h100` on the

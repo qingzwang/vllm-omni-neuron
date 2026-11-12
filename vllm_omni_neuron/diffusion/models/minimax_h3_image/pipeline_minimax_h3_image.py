@@ -196,6 +196,12 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             block.overlap_chunks = int(overrides.get("overlap_chunks", 1))
         # Head-major attention for long sequences only (see HEAD_MAJOR_MIN_ROWS).
         self.transformer.configure_head_major(bool(overrides.get("head_major_attention", True)))
+        # In-kernel collective + matmul for the sequence-parallel projections (fgcc_kernels.py).
+        if self.device.type != "cpu":
+            # Default: out-projection + FFN down kernels with head-major attention for long
+            # sequences (-7% per block at 4096x4096 on 16 cores); fgcc_qkv adds the Q/K/V
+            # all-gather kernel (replaces head-major; slightly slower in that combination).
+            self.transformer.configure_fgcc(bool(overrides.get("fgcc", True)), qkv=bool(overrides.get("fgcc_qkv", False)))
         vae_dtype = getattr(torch, str(overrides.get("vae_dtype", "bfloat16")))
         self.vae = NeuronMiniMaxH3ImageVAEDecoder(os.path.join(mp, "vae_diffusers"), dtype=vae_dtype)
         self.text_buckets = [int(b) for b in overrides.get("text_buckets", DEFAULT_TEXT_BUCKETS)]
