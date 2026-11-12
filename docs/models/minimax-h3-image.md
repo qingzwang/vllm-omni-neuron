@@ -180,6 +180,23 @@ elementwise work with the tensor engine idle takes 1.4 ms (13%) and nothing runs
 gap was the segment slicing described above, which was then removed (-18% per block at this
 size, -27% at 4096x4096 on 16 cores).
 
+### Single-instance throughput
+
+For serving many requests, one trn2.48xlarge can hold several independent copies of the
+pipeline. Each stage replica is a full TP=8 x CP=2 (or TP=8) pipeline with its own weights;
+vllm-omni load-balances requests across them. Per-request latency is that of one replica; the
+replicas start one after another (~1 minute each with a warm compile cache).
+
+| Stage config | Layout | 2048x2048 throughput | Per-request latency |
+|---|---|---|---|
+| [`minimax_h3_image_stage_tp8cp2.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/main/examples/minimax_h3_image/minimax_h3_image_stage_tp8cp2.yaml) | 1 x 16 cores | 0.65 images/s | 1.54 s |
+| [`minimax_h3_image_stage_tp8cp2_x4.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/main/examples/minimax_h3_image/minimax_h3_image_stage_tp8cp2_x4.yaml) | 4 x 16 cores | **2.58 images/s** | 1.54 s |
+| [`minimax_h3_image_stage_tp8_x8.yaml`](https://github.com/aws-neuron/vllm-omni-neuron/blob/main/examples/minimax_h3_image/minimax_h3_image_stage_tp8_x8.yaml) | 8 x 8 cores | **3.23 images/s** | ~2.5 s |
+
+Measured with `run.py --throughput N` (N = 16 / 32 requests submitted at once, after a warm-up
+round on every replica). Eight 8-core replicas give the most images per second; four 16-core
+replicas trade ~20% of that for 40% lower latency per image.
+
 ## Image editing
 
 Requests that carry reference images (`multi_modal_data["image"]`, or `run.py --image ref.png`

@@ -12,7 +12,7 @@ stages:
       dtype: bfloat16
       model_config:
         # Padded text lengths (one compiled DiT graph per bucket and canvas).
-        text_buckets: [256, 512, 1024, 2048, 4096]
+        text_buckets: [256, 512, 768, 1024, 1536, 2048, 3072, 4096]
       parallel_config:
         tensor_parallel_size: 8
         ring_degree: 8

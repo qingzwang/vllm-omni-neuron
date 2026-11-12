@@ -57,9 +57,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_SIZE = 2048
 DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
 MAX_SEQUENCE_LENGTH = 4096
-DEFAULT_TEXT_BUCKETS = (256, 512, 1024, 2048, 4096)
+# Padding rows cost full matmul work (and query-side attention), so buckets grow by at most
+# ~1.5x; each bucket is one more compiled graph set (cached on disk after the first use).
+DEFAULT_TEXT_BUCKETS = (256, 512, 768, 1024, 1536, 2048, 3072, 4096)
 # Edit presentations carry a vision block per reference (~1k tokens at the 1024 short edge).
-DEFAULT_EDIT_TEXT_BUCKETS = (2048, 4096, 8192, 16384)
+DEFAULT_EDIT_TEXT_BUCKETS = (1024, 1536, 2048, 2560, 3072, 4096, 5120, 6144, 8192, 10240, 12288, 16384)
 REFERENCE_SHORT_EDGE = (1024, 2048)  # VAE copy of a reference
 VISION_SHORT_EDGE = (1024, 1024)  # vision-tower copy of a reference
 MAX_REFERENCES = 16
@@ -176,6 +178,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             overrides.get("cache_steps", ()),
             tuple(overrides["cache_block_groups"]) if overrides.get("cache_block_groups") else None,
         )
+        # "online" (attention_cte, default) or "const_max" (see minimax_h3_image_transformer).
+        self.transformer.configure_attention(str(overrides.get("attention", "online")))
+        for block in self.transformer.blocks:  # one CP all-gather for K and V
+            block.attn.fuse_kv_gather = bool(overrides.get("fuse_kv_gather", True))
         # Token chunks of each block's post-attention tail, so TP all-reduces overlap matmuls.
         for block in self.transformer.blocks:
             block.overlap_chunks = int(overrides.get("overlap_chunks", 1))
@@ -198,6 +204,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self._text_fn = self.transformer.prepare_text
         self._vae_fn = self.vae.forward
         self._gather_fn = self._gather_tiles
+        self._bcast_fn = self._broadcast_rank0
         self._cat_fn = _cat0
         self.tp_size = self.transformer.tp_size
         self.tp_rank = self.transformer.tp_rank
@@ -254,6 +261,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             group_mods = [m.to(self.device) for m in self.transformer.split_mods(mods)]
             steps.append((group_mods, out[i].to(self.device), w.to(self.device), b.to(self.device)))
         self._step_tables = steps
+        # fp32 sigma_i - sigma_{i+1}, rounded on the host exactly as the reference sampler does
+        self._euler_dts = [(self.sigmas[i] - self.sigmas[i + 1]).reshape(1).to(self.device) for i in range(n)]
 
     def compile(self, *args, **kwargs):
         backend = kwargs.get("backend")
@@ -269,6 +278,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.transformer.compile_step(comp)
         self._vae_fn = comp(self.vae.forward, "vae_decode")
         self._gather_fn = comp(self._gather_tiles, "vae_gather")
+        self._bcast_fn = comp(self._broadcast_rank0, "broadcast_rank0")
         self._cat_fn = comp(_cat0, "cat_tiles")
         self._venc_fn = comp(self.vae_encoder.forward, "vae_encode") if hasattr(self, "vae_encoder") else None
         self._venc_comp = comp
@@ -315,32 +325,185 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         return self._edit_host
 
     def _edit_inputs(self, prompt: str, images, sp, lh: int, lw: int) -> dict:
-        """Host side of an edit, computed on rank 0 and broadcast (reference order of RNG draws:
-        one posterior sample per reference, then the target noise, then the reference noise)."""
-        cfg = self.transformer.config
+        # Workers run single-threaded; the edit preparation runs on every rank at once, so give
+        # each rank its share of the host's cores for it.
+        prev = torch.get_num_threads()
+        torch.set_num_threads(max(1, (os.cpu_count() or 1) // max(1, self.world)))
+        try:
+            return self._edit_inputs_impl(prompt, images, sp, lh, lw)
+        finally:
+            torch.set_num_threads(prev)
+
+    def _edit_inputs_impl(self, prompt: str, images, sp, lh: int, lw: int) -> dict:
+        """Inputs of an edit on every rank.
+
+        Deterministic parts (resize, vision grids, presentation tokens, MRoPE tables) run on
+        every rank; the image processor only for the references a rank encodes. The references are VAE-encoded tile-parallel; rank 0 draws the random
+        tensors in the reference order (one posterior sample per reference, then the target
+        noise, then the reference noise) and broadcasts them (a few MB). Reference ``i``'s vision
+        tower runs on rank ``i % world``; every rank scatters its images' features (rank 0 also
+        the text-token embeddings) into zero buffers and one device all-reduce assembles the
+        presentation embeddings and deepstack rows on every rank.
+        """
+        tm = self._edit_times = {}
+        t0 = time.perf_counter()
         ref_imgs, vis_imgs = self._edit_resize(images)
+        vision, dev_vision, proc = self._edit_host_models()
+        ip = proc.image_processor
+        grid_thw = self._vision_grids(ip, vis_imgs)
+        # pixel patches only for the references this rank encodes (see _presentation_embeddings)
+        pixels = {}
+        for i in range(len(vis_imgs)):
+            if i % self.world == self.rank:
+                vin = ip(images=[vis_imgs[i]], return_tensors="pt")
+                if vin["image_grid_thw"][0].tolist() != grid_thw[i].tolist():
+                    raise RuntimeError(f"vision grid {vin['image_grid_thw'][0].tolist()} != {grid_thw[i].tolist()}")
+                pixels[i] = vin["pixel_values"]
+        token_ids, tags = self._presentation_tokens(prompt, grid_thw, ip.merge_size ** 2)
+        mm = proc.create_mm_token_type_ids([token_ids])[0]
+        # reference latent grids: the encoder sees the 16-px crop, the DiT whole 2x2 patches
+        grids = []
+        for im in ref_imgs:
+            w, h = im.size
+            grids.append(((h // 16) // 2 * 2, (w // 16) // 2 * 2))
+        n_ref = sum((gh // 2) * (gw // 2) for gh, gw in grids)
+        n_t = (lh // 2) * (lw // 2)
+        ref_pad = -(-n_ref // 1024) * 1024
+        text_pad = choose_text_pad(len(token_ids), n_t + ref_pad, self.cp_size, self.edit_text_buckets)
+        tm["prep"] = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
         moments = self._encode_references(ref_imgs)  # rank 0: per-reference posterior moments
-        meta = [None]
+        tm["vae_encode"] = time.perf_counter() - t1
+
+        t1 = time.perf_counter()
+        noise = torch.empty((1, self.transformer.config.in_channels, 1, lh, lw), dtype=torch.float32)
+        rows = torch.empty(ref_pad, self.transformer.config.patch_dim, dtype=torch.float32)
         if self.rank == 0:
-            prev = torch.get_num_threads()
-            torch.set_num_threads(HOST_POSTPROCESS_THREADS)
-            try:
-                payload = self._edit_inputs_rank0(prompt, ref_imgs, vis_imgs, moments, sp, lh, lw)
-            finally:
-                torch.set_num_threads(prev)
-            meta[0] = {k: v for k, v in payload.items() if not isinstance(v, torch.Tensor)}
-            meta[0]["shapes"] = {k: (tuple(v.shape), str(v.dtype)) for k, v in payload.items() if isinstance(v, torch.Tensor)}
+            noise, rows = self._reference_noise(moments, grids, ref_pad, sp, lh, lw)
         if self.world > 1:
-            dist.broadcast_object_list(meta, src=0)
-        if self.rank != 0:
-            payload = dict(meta[0])
-            for k, (shape, dt) in meta[0]["shapes"].items():
-                payload[k] = torch.empty(shape, dtype=getattr(torch, dt.split(".")[-1]))
-        if self.world > 1:
-            for k in sorted(meta[0]["shapes"]):
-                dist.broadcast(payload[k], src=0)
-        del cfg
-        return payload
+            dist.broadcast(noise, src=0)
+            dist.broadcast(rows, src=0)
+        tm["sample"] = time.perf_counter() - t1
+
+        t1 = time.perf_counter()
+        emb, ds = self._presentation_embeddings(token_ids, pixels, grid_thw, text_pad, vision, dev_vision)
+        tm["presentation"] = time.perf_counter() - t1
+        cos, sin = vision.rope_tables(token_ids, mm, grid_thw, text_pad)
+        return dict(num_text=len(token_ids), text_pad=text_pad, token_tags=tags, grids=grids, ref_pad=ref_pad,
+                    emb=emb, deepstack=ds, cos=cos, sin=sin, noise=noise, ref_rows=rows)
+
+    @staticmethod
+    def _vision_grids(ip, images) -> torch.Tensor:
+        """``[n, 3]`` (t, h, w) patch grids the image processor gives each image (its
+        smart_resize), without running it."""
+        from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+        grids = []
+        for im in images:
+            w, h = im.size
+            rh, rw = smart_resize(h, w, factor=ip.patch_size * ip.merge_size,
+                                  min_pixels=ip.size["shortest_edge"], max_pixels=ip.size["longest_edge"])
+            grids.append([1, rh // ip.patch_size, rw // ip.patch_size])
+        return torch.tensor(grids, dtype=torch.long)
+
+    def _presentation_tokens(self, prompt, grid_thw, merge):
+        """``Picture i: `` + vision block per reference, then the prompt (no chat template)."""
+        from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
+
+        tok = self.tokenizer
+        token_ids, tags = [], []
+        for i, grid in enumerate(grid_thw):
+            label = tok(f"Picture {i + 1}: ", add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+            vids = ([tok.convert_tokens_to_ids("<|vision_start|>")]
+                    + [tok.convert_tokens_to_ids("<|image_pad|>")] * (int(grid.prod()) // merge)
+                    + [tok.convert_tokens_to_ids("<|vision_end|>")])
+            token_ids += label + vids
+            tags += [_TXT] * len(label) + [_IMG] * len(vids)
+        pids = tok(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+        return token_ids + pids, tags + [_TXT] * len(pids)
+
+    def _reference_noise(self, moments, grids, ref_pad, sp, lh, lw):
+        """Rank 0: target noise and the noised reference rows ``[ref_pad, patch_dim]``."""
+        from .vae_encoder import MiniMaxH3ImageVAEEncoder
+
+        gen = self._generator(sp)
+        ref_latents = []
+        for mom, (gh, gw) in zip(moments, grids):
+            # posterior sample (generator), fp16 round, crop to whole patches, normalize
+            lat = MiniMaxH3ImageVAEEncoder.sample(mom, gen).to(torch.float16).float()[..., :gh, :gw]
+            ref_latents.append((lat - self._vae_latents_mean) / self._vae_latents_std)
+        noise = torch.randn((1, self.transformer.config.in_channels, 1, lh, lw), generator=gen, dtype=torch.float32)
+        ref_rows = []
+        t = torch.tensor(REFERENCE_NOISE_AUG, dtype=torch.float32)
+        for lat in ref_latents:
+            nz = torch.randn(lat.shape, generator=gen, dtype=torch.float32)
+            ref_rows.append(patchify(t * lat + (1.0 - t) * nz))
+        ref_rows = torch.cat(ref_rows)
+        rows = torch.zeros(ref_pad, ref_rows.shape[1], dtype=torch.float32)
+        rows[: ref_rows.shape[0]] = ref_rows
+        return noise, rows
+
+    def _presentation_embeddings(self, token_ids, pixels, grids, text_pad, vision, dev_vision):
+        """``[1, text_pad, H]`` inputs_embeds and ``[3, text_pad, H]`` deepstack rows on the device.
+
+        Rank ``i % world`` encodes reference ``i``. Each rank fills only its rows (rank 0 the
+        text tokens too) and a device TP + CP all-reduce sums the disjoint parts (exact)."""
+        from .qwen3_vision_neuron import vision_bucket, vision_host_prep
+
+        ids = torch.zeros(1, text_pad, dtype=torch.long)
+        ids[0, : len(token_ids)] = torch.tensor(token_ids)
+        is_img = ids[0] == vision.image_token_id
+        is_img[len(token_ids):] = False
+        img_rows = torch.nonzero(is_img).flatten()
+        n_patches = [int(g.prod()) for g in grids]
+        merge = vision.cfg.vision_config.spatial_merge_size ** 2
+        mine = [i for i in range(len(grids)) if i % self.world == self.rank]
+        if self.rank == 0:
+            emb = self.text_encoder.embed(ids)  # [1, T, H] bf16 (image-pad rows replaced below)
+            emb[0, is_img] = 0
+        else:
+            emb = None
+        ds = None
+        row0 = [0]
+        for n in n_patches:
+            row0.append(row0[-1] + n // merge)
+        if int(is_img.sum()) != row0[-1]:
+            raise ValueError(f"{int(is_img.sum())} image tokens for {row0[-1]} image features")
+        t_v = time.perf_counter()
+        for i in mine:
+            pv = pixels[i]
+            if dev_vision is not None:
+                model, fn = dev_vision
+                (patches, pos, c, s_), n_real = vision_host_prep(vision.vision, pv, grids[i][None], vision_bucket(n_patches[i]))
+                kv = torch.tensor([n_real], dtype=torch.int32)
+                outs = [o.cpu()[: n_real // merge] for o in fn(*(t.to(self.device) for t in (patches, pos, c, s_, kv)))]
+            else:
+                e, d = vision.encode_images(pv, grids[i][None])
+                outs = [e] + list(d)
+            if emb is None:
+                emb = torch.zeros(1, text_pad, outs[0].shape[-1], dtype=torch.bfloat16)
+            if ds is None:
+                ds = torch.zeros(len(outs) - 1, text_pad, outs[0].shape[-1], dtype=torch.bfloat16)
+            rows = img_rows[row0[i] : row0[i + 1]]
+            emb[0, rows] = outs[0].to(torch.bfloat16)
+            for k in range(len(outs) - 1):
+                ds[k, rows] = outs[k + 1].to(torch.bfloat16)
+        self._edit_times[f"vision_r{self.rank}"] = time.perf_counter() - t_v
+        h = self.text_encoder.hidden_size
+        if self.world == 1:
+            return emb, ds
+        on_device = self.device.type != "cpu" and self.world == self.tp_size * self.cp_size
+        if not on_device:  # host process group: sum the disjoint parts
+            emb = emb if emb is not None else torch.zeros(1, text_pad, h, dtype=torch.bfloat16)
+            ds = ds if ds is not None else torch.zeros(3, text_pad, h, dtype=torch.bfloat16)
+            dist.all_reduce(emb)
+            dist.all_reduce(ds)
+            return emb, ds
+        dev = self.device
+        emb_d = emb.to(dev) if emb is not None else torch.zeros(1, text_pad, h, dtype=torch.bfloat16, device=dev)
+        ds_d = ds.to(dev) if ds is not None else torch.zeros(3, text_pad, h, dtype=torch.bfloat16, device=dev)
+        return self._bcast_fn(emb_d, ds_d)
 
     def _edit_resize(self, images):
         """Every rank: references upright in RGB, resized for the VAE and for the vision tower."""
@@ -377,7 +540,6 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         moments of each reference on rank 0 (None elsewhere)."""
         import numpy as np
 
-        from .vae_decoder import stitch_tiles
         from .vae_encoder import tile_plan
 
         pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
@@ -418,78 +580,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         moments = []
         for start, cnt, (ny, nx), yo, xo in plans:
             t = all_tiles[start : start + cnt]
-            moments.append(stitch_tiles([[t[a * nx + b : a * nx + b + 1] for b in range(nx)] for a in range(ny)], yo, xo))
+            moments.append(stitch_tiles_direct(t, ny, nx, yo, xo))  # == the reference blend, bit for bit
         return moments
-
-    def _edit_inputs_rank0(self, prompt, ref_imgs, vis_imgs, moments, sp, lh, lw) -> dict:
-        from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
-        from .vae_encoder import MiniMaxH3ImageVAEEncoder
-
-        vision, dev_vision, proc = self._edit_host_models()
-        # presentation: "Picture i: " + vision block per reference, then the prompt (no template)
-        tok = self.tokenizer
-        vin = proc.image_processor(images=vis_imgs, return_tensors="pt")
-        merge = proc.image_processor.merge_size ** 2
-        token_ids, tags = [], []
-        for i, grid in enumerate(vin["image_grid_thw"]):
-            label = tok(f"Picture {i + 1}: ", add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
-            vids = ([tok.convert_tokens_to_ids("<|vision_start|>")]
-                    + [tok.convert_tokens_to_ids("<|image_pad|>")] * (int(grid.prod()) // merge)
-                    + [tok.convert_tokens_to_ids("<|vision_end|>")])
-            token_ids += label + vids
-            tags += [_TXT] * len(label) + [_IMG] * len(vids)
-        pids = tok(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
-        token_ids += pids
-        tags += [_TXT] * len(pids)
-
-        # posterior sample (generator), fp16 round, crop to whole patches, normalize
-        gen = self._generator(sp)
-        ref_latents = []
-        for mom in moments:
-            lat = MiniMaxH3ImageVAEEncoder.sample(mom, gen).to(torch.float16).float()
-            lat = lat[..., : lat.shape[-2] // 2 * 2, : lat.shape[-1] // 2 * 2]
-            ref_latents.append((lat - self._vae_latents_mean) / self._vae_latents_std)
-        noise = torch.randn((1, self.transformer.config.in_channels, 1, lh, lw), generator=gen, dtype=torch.float32)
-        ref_rows = []
-        for lat in ref_latents:
-            nz = torch.randn(lat.shape, generator=gen, dtype=torch.float32)
-            t = torch.tensor(REFERENCE_NOISE_AUG, dtype=torch.float32)
-            ref_rows.append(patchify(t * lat + (1.0 - t) * nz))
-        ref_rows = torch.cat(ref_rows)
-        n_ref = ref_rows.shape[0]
-        n_t = (lh // 2) * (lw // 2)
-        ref_pad = -(-n_ref // 1024) * 1024
-        text_pad = choose_text_pad(len(token_ids), n_t + ref_pad, self.cp_size, self.edit_text_buckets)
-        rows = torch.zeros(ref_pad, ref_rows.shape[1], dtype=torch.float32)
-        rows[:n_ref] = ref_rows
-        mm = proc.create_mm_token_type_ids([token_ids])[0]
-        encode_fn = None
-        if dev_vision is not None:
-            from .qwen3_vision_neuron import vision_bucket, vision_host_prep
-
-            model, fn = dev_vision
-
-            def encode_fn(pixel_values, grid_thw):
-                """One device call per image (patches padded to a bucket); concatenated outputs."""
-                per_image, start = [], 0
-                for g in grid_thw:
-                    n = int(g.prod())
-                    pv = pixel_values[start : start + n]
-                    start += n
-                    (patches, pos, c, s_), n_real = vision_host_prep(vision.vision, pv, g[None], vision_bucket(n))
-                    kv = torch.tensor([n_real], dtype=torch.int32)
-                    outs = fn(*(t.to(self.device) for t in (patches, pos, c, s_, kv)))
-                    per_image.append([o.cpu()[: n_real // 4] for o in outs])
-                embeds = torch.cat([o[0] for o in per_image])
-                deep = [torch.cat([o[k] for o in per_image]) for k in range(1, len(per_image[0]))]
-                return embeds, deep
-
-        emb, ds, cos, sin = vision.presentation_inputs(
-            token_ids, mm, vin["pixel_values"], vin["image_grid_thw"], self.text_encoder.embed, text_pad,
-            encode_fn=encode_fn)
-        return dict(num_text=len(token_ids), text_pad=text_pad, token_tags=tags,
-                    grids=[tuple(int(v) for v in r.shape[-2:]) for r in ref_latents], ref_pad=ref_pad,
-                    emb=emb, deepstack=ds, cos=cos, sin=sin, noise=noise, ref_rows=rows)
 
     @staticmethod
     def _prompt_of(raw) -> str:
@@ -532,6 +624,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             edit = self._edit_inputs(prompt, images, sp, lh, lw)
             num_text, text_pad = edit["num_text"], edit["text_pad"]
             timings["edit_host_s"] = time.perf_counter() - t0
+            timings.update({f"edit_{k}_s": v for k, v in self._edit_times.items()})
         else:
             token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
             num_text = len(token_ids)
@@ -586,15 +679,21 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             noise = torch.randn((1, cfg.in_channels, 1, lh, lw), generator=self._generator(sp), dtype=torch.float32)
         latents = patchify(noise[:, :, 0])
         self.transformer.reset_step_cache()
+        # Latents stay on the device: each step's final graph applies the Euler update.
+        rows = (latents if ref_rows is None else torch.cat([latents, ref_rows]))[None].to(dev)
+        prev = None
         for i in range(len(self.timesteps)):
             mods, out_mod, head_w, head_b = self._step_tables[i]
-            rows = latents[None] if ref_rows is None else torch.cat([latents, ref_rows])[None]
-            v = self.transformer(
-                rows.to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b, step=i,
-                tabs=tabs, perm=perm,
+            rows_next = self.transformer(
+                rows, text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b, step=i,
+                tabs=tabs, perm=perm, euler_dt=self._euler_dts[i], num_generated=n_img,
             )
-            v = v.cpu()[0, :n_img].float()  # the generated rows come first in both layouts
-            latents = latents + (self.sigmas[i] - self.sigmas[i + 1]) * v
+            # Bound the work in flight to ~two steps (the runtime queue holds 63 executions,
+            # a step is ~12): wait for the previous step while this one runs on the device.
+            if prev is not None:
+                prev.cpu()
+            prev, rows = rows, rows_next
+        latents = rows.cpu()[0, :n_img]  # the generated rows come first in both layouts
         timings["denoise_s"] = time.perf_counter() - t0
 
         if getattr(sp, "output_type", None) == "latent":
@@ -633,6 +732,18 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         logger.info("MiniMax-H3-Image request timings: %s", timings)
         # uint8 [1, 3, H, W]: 4x less to ship back to the engine than float.
         return image.contiguous()
+
+    def _broadcast_rank0(self, *tensors):
+        """Sum of every rank's tensors on every rank (TP then CP all-reduce). With disjoint
+        non-zero parts (e.g. rank 0: x, others: 0) the sum is exact."""
+        outs = []
+        for x in tensors:
+            if self.tp_size > 1:
+                dist.all_reduce(x, group=self._tp_group)
+            if self.cp_size > 1:
+                dist.all_reduce(x, group=get_sp_group().device_group)
+            outs.append(x)
+        return tuple(outs)
 
     def _gather_tiles(self, out: torch.Tensor) -> torch.Tensor:
         """All ranks' decoded tiles, in ``cp_rank * tp + tp_rank`` slot order (in-graph)."""

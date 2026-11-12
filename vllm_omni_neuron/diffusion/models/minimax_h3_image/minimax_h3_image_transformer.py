@@ -180,7 +180,66 @@ def _torch_attention(q, k, v, kv_len):
     return torch.matmul(torch.softmax(scores, dim=-1), v.float()).to(q.dtype)
 
 
-def h3_attention(q, k, v, kv_len):
+# ------------------------------------------------------------------ constant-max attention
+#
+# Softmax is invariant to a per-(head, query) offset, so attention can skip the online max of
+# flash attention if every score sits in a known window around one offset per head (nkilib
+# attention_const_max, vendored with a per-key bias that also masks padding keys; ~1.5-1.7x
+# the attention_cte throughput at these shapes). The offset per head is
+#
+#     off = min_i L_i + CONST_MAX_WINDOW,   L_i = scale * max_j (q_i . k_j) over ~256 strided real keys
+#
+# L_i is a lower bound of query i's row max, so every real query's row max is >= off - WINDOW:
+# its probabilities never underflow (measured on Trn2: exact down to ~e^-80 of the offset).
+# A score overflows only if it exceeds off by ~75, i.e. the head's score range (max score -
+# min_i L_i) exceeds ~WINDOW + 75 = 135. Calibration over T2I (1024², 2048²) and edit requests:
+# <= ~105 in every block but 3, 36, 45 and 49 (45 and 49: ranges of ~600 and ~13000), which keep
+# the exact online-softmax kernel (CONST_MAX_EXCLUDED_BLOCKS).
+
+CONST_MAX_WINDOW = 60.0
+CONST_MAX_SAMPLE_KEYS = 256
+CONST_MAX_EXCLUDED_BLOCKS = (3, 36, 45, 49)
+_MASKED_KEY_BIAS = -1.0e30
+
+
+@nki.jit
+def _h3_const_max_kernel(q, k, v, key_bias):
+    # Kernel revision 1. The NKI compile cache keys on this function's source only, not on
+    # attention_const_max_bias.py: bump the revision whenever that module changes.
+    from nkilib.core.utils.common_types import AttentionLayout
+
+    from .attention_const_max_bias import attention_const_max
+
+    return attention_const_max(q, k, v, key_bias, _ATTN_SCALE, AttentionLayout.SEQ_MAJOR, AttentionLayout.SEQ_MAJOR)
+
+
+@nki_op("minimax_h3_image::attention_const_max")
+def _h3_nki_const_max(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, key_bias: torch.Tensor) -> torch.Tensor:
+    return wrap_nki_kernel(_h3_const_max_kernel, supported_lnc=(2,))(q, k, v, key_bias)
+
+
+def const_max_key_bias(q3, k3, kv_len, q_row0: int = 0):
+    """``[N, 128, Sk / 128]`` f32 exp bias of :func:`attention_const_max` (see the note above).
+
+    ``q3`` ``[N, Sq, D]`` holds physical rows ``q_row0 ...``; rows / keys ``>= kv_len`` are
+    padding (excluded from the bound, masked as keys)."""
+    n, sq, _ = q3.shape
+    sk = k3.shape[1]
+    kl = kv_len.reshape(1).to(torch.int32)
+    q_real = (torch.arange(sq, device=q3.device, dtype=torch.int32) + q_row0) < kl  # [Sq]
+    k_real = torch.arange(sk, device=k3.device, dtype=torch.int32) < kl  # [Sk]
+    # Static strided key sample; samples that fall on padding keys are excluded.
+    stride = max(1, sk // CONST_MAX_SAMPLE_KEYS)
+    sample = torch.matmul(q3, k3[:, ::stride].transpose(1, 2)).float()  # [N, Sq, ~256]
+    s_real = k_real[::stride]
+    lower = torch.amax(torch.where(s_real[None, None, :], sample, torch.full_like(sample, -3.0e38)), dim=-1)
+    lower = torch.where(q_real[None, :], lower * _ATTN_SCALE, torch.full_like(lower, 3.0e38))
+    off = torch.amin(lower, dim=-1) + CONST_MAX_WINDOW  # [N]
+    real = k_real.reshape(sk // 128, 128).transpose(0, 1)  # key t*128+p -> [p, t]
+    return torch.where(real[None], -off[:, None, None], torch.full((1, 1, 1), _MASKED_KEY_BIAS, device=k3.device))
+
+
+def h3_attention(q, k, v, kv_len, const_max: bool = False, q_row0: int = 0):
     """``q`` ``[1, Sq, N, D]``, ``k``/``v`` ``[1, Sk, N, D]`` -> ``[1, Sq, N*D]``."""
     _, sq, n, d = q.shape
     if d != 128:
@@ -189,7 +248,13 @@ def h3_attention(q, k, v, kv_len):
     q3 = q.transpose(1, 2).reshape(n, sq, d).contiguous()
     k3 = k.transpose(1, 2).reshape(n, sk, d).contiguous()
     v3 = v.transpose(1, 2).reshape(n, sk, d).contiguous()
-    if can_run_kernel(v3):
+    if const_max and can_run_kernel(v3) and sk % 128 == 0:
+        out = _h3_nki_const_max(q3, k3, v3, const_max_key_bias(q3, k3, kv_len, q_row0))
+        # Padding queries were left out of the offset; their rows may overflow. Zero them so
+        # that nothing non-finite reaches the next layer's (masked) padding keys.
+        q_real = (torch.arange(sq, device=q3.device, dtype=torch.int32) + q_row0) < kv_len.reshape(1).to(torch.int32)
+        out = torch.where(q_real[None, :, None], out, torch.zeros_like(out))
+    elif can_run_kernel(v3):
         out = _h3_nki_attention(q3, k3, v3, kv_len)
     else:
         out = _torch_attention(q3, k3, v3, kv_len)
@@ -224,6 +289,29 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rot = x_rot * cos + rotated * sin
     return torch.cat((x_rot, x_pass), dim=-1)
+
+
+def rope_full_tables(cos: torch.Tensor, sin: torch.Tensor, head_dim: int):
+    """``[S, rotary_dim]`` partial-rotary tables -> ``[S, head_dim]`` (``cos`` 1, ``sin`` 0 on
+    the pass-through dims) and the ``[head_dim, head_dim]`` signed permutation ``P`` with
+    ``(x @ P)[..., :r] == cat(-x2, x1)`` (rotate-half) and ``(x @ P)[..., r:] == 0``."""
+    r = cos.shape[-1]
+    h = r // 2
+    if r < head_dim:
+        pad = head_dim - r
+        cos = torch.cat([cos, torch.ones(cos.shape[0], pad, dtype=cos.dtype, device=cos.device)], dim=-1)
+        sin = torch.cat([sin, torch.zeros(sin.shape[0], pad, dtype=sin.dtype, device=sin.device)], dim=-1)
+    i = torch.arange(head_dim, device=cos.device)[:, None]  # input dim
+    j = torch.arange(head_dim, device=cos.device)[None, :]  # output dim
+    perm = torch.where((j < h) & (i == j + h), -1.0, torch.where((j >= h) & (j < r) & (i == j - h), 1.0, 0.0))
+    return cos, sin, perm.to(cos.dtype)
+
+
+def apply_rotary_full(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    """:func:`apply_rotary` without slicing / concatenation along the head dim: the same
+    products and sum on the rotary dims (rotate-half as an exact +-1 permutation matmul),
+    ``x * 1 + 0`` on the pass-through dims. ``cos``/``sin``/``perm`` from :func:`rope_full_tables`."""
+    return x * cos[None, :, None, :] + torch.matmul(x, perm) * sin[None, :, None, :]
 
 
 # ===================================================================
@@ -317,6 +405,9 @@ class H3Attention(nn.Module):
         cp_group = get_cp_group()
         self.cp_size = cp_group.world_size if use_cp else 1
         self.cp_group = cp_group if self.cp_size > 1 else None
+        self.cp_rank = cp_group.rank_in_group if self.cp_size > 1 else 0
+        self.const_max = False  # set per block by MiniMaxH3ImageTransformer.configure_attention
+        self.fuse_kv_gather = True
 
         self.qkv_weight = nn.Parameter(torch.empty(hidden, 3 * local, dtype=torch.bfloat16))
         set_weight_loader(
@@ -347,12 +438,21 @@ class H3Attention(nn.Module):
         k = rms_norm(k.unflatten(-1, (self.num_heads, self.head_dim)), self.norm_k_weight, self.eps)
         v = v.unflatten(-1, (self.num_heads, self.head_dim))
         if cos is not None:
-            q = apply_rotary(q, cos, sin)
-            k = apply_rotary(k, cos, sin)
+            if isinstance(cos, tuple):  # (cos_full, sin_full, perm) from rope_full_tables
+                cos_f, sin_f, perm = cos
+                q = apply_rotary_full(q, cos_f, sin_f, perm)
+                k = apply_rotary_full(k, cos_f, sin_f, perm)
+            else:
+                q = apply_rotary(q, cos, sin)
+                k = apply_rotary(k, cos, sin)
         if self.cp_size > 1:
-            k = self.cp_group.all_gather(k.contiguous(), dim=1)
-            v = self.cp_group.all_gather(v.contiguous(), dim=1)
-        return h3_attention(q, k, v, kv_len)
+            if self.fuse_kv_gather:  # one CP all-gather for K and V (half the collective launches)
+                kv = self.cp_group.all_gather(torch.cat([k, v], dim=-1).contiguous(), dim=1)
+                k, v = kv.split(self.head_dim, dim=-1)
+            else:
+                k = self.cp_group.all_gather(k.contiguous(), dim=1)
+                v = self.cp_group.all_gather(v.contiguous(), dim=1)
+        return h3_attention(q, k, v, kv_len, self.const_max, self.cp_rank * q.shape[1])
 
 
 class H3FeedForward(nn.Module):
@@ -658,12 +758,16 @@ class _BlockGroup(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.segments: list[tuple[int, int, int]] = []
         self.base = 0
+        self.rope_no_cat = True
 
     def set_segments(self, segments, base) -> None:
         self.segments, self.base = list(segments), int(base)
 
     def forward(self, x, mods, cos, sin, kv_len, tabs=None):
         segments = self.segments if tabs is None else tabs
+        if self.rope_no_cat and cos is not None:
+            cos = rope_full_tables(cos, sin, self.blocks[0].attn.head_dim)  # once per group graph
+            sin = None
         for j, block in enumerate(self.blocks):
             x = block(x, mods[j], cos, sin, kv_len, segments, self.base)
         return x
@@ -729,6 +833,18 @@ class MiniMaxH3ImageTransformer(nn.Module):
             block.sequence_parallel = self.sequence_parallel
         self.configure_layer_groups(layers_per_graph)
         self.configure_step_cache(())
+        self.configure_attention("online")
+
+    def configure_attention(self, kind: str = "online", excluded_blocks=CONST_MAX_EXCLUDED_BLOCKS) -> None:
+        """``"const_max"``: constant-max attention in every block but ``excluded_blocks``;
+        ``"online"``: the online-softmax attention_cte kernel everywhere."""
+        if kind not in ("const_max", "online"):
+            raise ValueError(f"attention={kind!r}; supported: 'const_max', 'online'")
+        excluded = {int(b) for b in excluded_blocks}
+        self._attn_const_max = [kind == "const_max" and i not in excluded for i in range(len(self.blocks))]
+        for block, flag in zip(self.blocks, self._attn_const_max):
+            block.attn.const_max = flag
+        self.attention_kind = kind
 
     # ------------------------------------------------------------------ layout
 
@@ -825,11 +941,23 @@ class MiniMaxH3ImageTransformer(nn.Module):
             out = self.cp_group.all_gather(out.contiguous(), dim=1)
         return out
 
+    def finalize_euler(self, x, out_mod, head_weight, head_bias, image_rows, dt):
+        """:meth:`finalize` fused with the velocity-form Euler update of the generated rows:
+        ``image_rows[:, :N] + dt * v[:, :N]`` (fp32, the first ``N`` physical rows are the
+        generated ones in both layouts); rows past ``N`` (edit references) are carried over."""
+        v = self.finalize(x, out_mod, head_weight, head_bias)
+        n = self._num_generated
+        new = image_rows[:, :n] + dt * v[:, :n]
+        if n == image_rows.shape[1]:
+            return new
+        return torch.cat([new, image_rows[:, n:]], dim=1)
+
     def compile_step(self, compile_fn) -> None:
         """Replace the step pieces with ``compile_fn(fn, name)`` versions."""
         self._embed_fn = compile_fn(self.embed, "embed")
         self._group_fn = compile_fn(self.run_group, f"blocks_x{self.layers_per_graph}")
         self._final_fn = compile_fn(self.finalize, "final")
+        self._final_euler_fn = compile_fn(self.finalize_euler, "final_euler")
         self._sub_fn = compile_fn(_sub, "cache_residual")
         self._add_fn = compile_fn(_add, "cache_reuse")
 
@@ -865,6 +993,8 @@ class MiniMaxH3ImageTransformer(nn.Module):
         step: int | None = None,
         tabs: torch.Tensor | None = None,
         perm: torch.Tensor | None = None,
+        euler_dt: torch.Tensor | None = None,
+        num_generated: int | None = None,
     ) -> torch.Tensor:
         """One denoising step (host orchestration of the compiled pieces).
 
@@ -877,8 +1007,13 @@ class MiniMaxH3ImageTransformer(nn.Module):
             out_mod: ``[2, H]`` bf16 output-norm ``shift`` and ``scale`` for this step.
             head_weight, head_bias: ``[H, patch_dim]`` / ``[patch_dim]`` fp32 PDD head of this step.
 
+            euler_dt: optional ``[1]`` fp32 ``sigma_i - sigma_{i+1}`` on the device. When given,
+                the step returns the updated ``image_rows`` (Euler step of the first
+                ``num_generated`` rows, the rest unchanged) so latents stay on the device.
+
         Returns:
-            ``[1, total, patch_dim]`` fp32; rows ``[:N_img]`` are the image velocities.
+            ``[1, total, patch_dim]`` fp32 where rows ``[:N_img]`` are the image velocities,
+            or the updated ``[1, N_img, patch_dim]`` image rows when ``euler_dt`` is given.
         """
         n_img = image_rows.shape[1]
         total = n_img + text_hidden.shape[1]
@@ -908,6 +1043,11 @@ class MiniMaxH3ImageTransformer(nn.Module):
                     g = g1
                     continue
                 x_in = x
+            # The group graph's code comes from the template (aliasing blocks[:K]); give it this
+            # group's attention kernels (one compiled variant per distinct pattern).
+            k_ = self.layers_per_graph
+            for j, tb in enumerate(self._group_template.blocks):
+                tb.attn.const_max = self._attn_const_max[g * k_ + j]
             if tabs is None:
                 x = run(x, group_mods[g], cos, sin, kv_len, self._group_params[g])
             else:
@@ -915,6 +1055,10 @@ class MiniMaxH3ImageTransformer(nn.Module):
             if cache_steps and not reuse and g == g1 - 1:
                 self._cache_residual = getattr(self, "_sub_fn", _sub)(x, x_in)
             g += 1
+        if euler_dt is not None:
+            self._num_generated = int(num_generated if num_generated is not None else n_img)
+            final_euler = getattr(self, "_final_euler_fn", self.finalize_euler)
+            return final_euler(x, out_mod, head_weight, head_bias, image_rows, euler_dt)
         return final(x, out_mod, head_weight, head_bias)
 
     # ------------------------------------------------------------------ weights

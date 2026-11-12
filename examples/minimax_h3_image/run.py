@@ -41,6 +41,9 @@ parser.add_argument("--cache-steps", default=None,
 parser.add_argument("--output", default="minimax_h3_image.png")
 parser.add_argument("--profile", action="store_true", help="Run timed warm generations after the first")
 parser.add_argument("--profile-runs", type=int, default=3)
+parser.add_argument("--throughput", type=int, default=0,
+                    help="After the first generation, submit N requests at once "
+                         "and report images/s; with a multi-replica stage config they run concurrently")
 args = parser.parse_args()
 
 env_profiles.apply(env_profiles.MINIMAX_H3_IMAGE, env_profiles.thread_limits(16))
@@ -96,6 +99,14 @@ def main():
             times.append(time.perf_counter() - t0)
             print(f"[profile] run {i + 1}: {times[-1]:.3f}s")
         print(f"[profile] {args.height}x{args.width}: avg {sum(times) / len(times):.3f}s min {min(times):.3f}s")
+
+    if args.throughput:
+        reqs = [dict(request) for _ in range(args.throughput)]
+        omni.generate(reqs, params)  # warm every replica (each compiles / loads on first use)
+        t0 = time.perf_counter()
+        outs = omni.generate(reqs, params)
+        dt = time.perf_counter() - t0
+        print(f"[throughput] {len(outs)} images {args.height}x{args.width} in {dt:.2f}s: {len(outs) / dt:.3f} images/s")
 
     images = result[0].images
     image = images[0] if isinstance(images, list) else images
