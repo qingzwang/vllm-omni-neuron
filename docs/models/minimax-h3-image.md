@@ -86,9 +86,11 @@ All changes are numerically equivalent to the diffusers reference up to bf16 rou
 - **Text encoder.** Only the 50 layers that feed `hidden_states[50]` are built (TP over
   the same TP group as the DiT); the token embedding lookup runs on the host.
 - **VAE decode.** The reference decodes in overlapping 256-pixel tiles of identical
-  shape; tiles are batched across all ranks, gathered in bf16 (the decoder's output
-  precision) and stitched on rank 0 with the reference blending. The image is returned to
-  the engine as uint8.
+  shape; tiles are batched across all ranks and gathered in-graph on the device in bf16 (the
+  decoder's output precision). Rank 0 copies them to the host once and stitches them by
+  writing each tile's reference blend weights straight into one buffer (bit-identical to
+  the reference's blend-and-concatenate stitch, 2x faster). The image is returned to the
+  engine as uint8.
 
 ### Recommended configurations
 
@@ -158,12 +160,12 @@ average of three generations. "Denoise" is six DiT steps; "Request" is the wall 
 
 | Cores | Resolution | Denoise (6 steps) | VAE decode | Request | PSNR vs reference |
 |---|---|---|---|---|---|
-| 8 | 1024x1024 | 0.66 s | 0.05 s | **0.75 s** | 23.6 dB |
-| 8 | 2048x2048 | 2.19 s | 0.23 s | **2.55 s** | 34.0 dB |
-| 8 | 4096x4096 | 12.2 s | 0.89 s | **13.4 s** | 30.1 dB |
-| 16 | 1024x1024 | 0.47 s | 0.04 s | **0.55 s** | 22.9 dB |
-| 16 | 2048x2048 | 1.35 s | 0.20 s | **1.68 s** | 30.2 dB |
-| 16 | 4096x4096 | 6.19 s | 0.62 s | **7.28 s** | 30.2 dB |
+| 8 | 1024x1024 | 0.66 s | 0.05 s | **0.74 s** | 23.6 dB |
+| 8 | 2048x2048 | 2.19 s | 0.20 s | **2.47 s** | 34.0 dB |
+| 8 | 4096x4096 | 12.1 s | 0.76 s | **13.0 s** | 30.1 dB |
+| 16 | 1024x1024 | 0.47 s | 0.03 s | **0.54 s** | 22.9 dB |
+| 16 | 2048x2048 | 1.35 s | 0.15 s | **1.59 s** | 30.2 dB |
+| 16 | 4096x4096 | 6.20 s | 0.50 s | **7.06 s** | 30.2 dB |
 
 Text encoding takes 8-20 ms in every configuration. Cold first requests compile for
 ~1-5 minutes (one compiled 5-block graph is reused for all 50 blocks).

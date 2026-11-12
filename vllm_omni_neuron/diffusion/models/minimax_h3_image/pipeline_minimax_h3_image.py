@@ -34,7 +34,10 @@ from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 
 from .layout import build_layout, choose_text_pad, get_image_canvas_size, patchify, unpatchify
+from vllm.distributed.parallel_state import get_tp_group
+
 from .minimax_h3_image_transformer import (
+    tp_all_gather_rows,
     IMAGE_TAG,
     REFERENCE_NOISE_AUG,
     TEXT_TAG,
@@ -44,7 +47,7 @@ from .minimax_h3_image_transformer import (
     build_rope_tables,
 )
 from .qwen3_text_encoder import TEXT_ENCODER_LAYER, NeuronQwen3TextEncoder
-from .vae_decoder import NeuronMiniMaxH3ImageVAEDecoder, plan_tiles, stitch_tiles
+from .vae_decoder import NeuronMiniMaxH3ImageVAEDecoder, plan_tiles, stitch_tiles_direct
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +179,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self._te_fn = self.text_encoder.forward
         self._text_fn = self.transformer.prepare_text
         self._vae_fn = self.vae.forward
+        self._gather_fn = self._gather_tiles
+        self.tp_size = self.transformer.tp_size
+        self.tp_rank = self.transformer.tp_rank
+        self._tp_group = get_tp_group().device_group
         self._step_tables: list | None = None
         self.skip_warmup = True
         self._last_timings: dict | None = None
@@ -230,6 +237,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self._text_fn = comp(self.transformer.prepare_text, "text_stream")
         self.transformer.compile_step(comp)
         self._vae_fn = comp(self.vae.forward, "vae_decode")
+        self._gather_fn = comp(self._gather_tiles, "vae_gather")
+
         return self
 
     # ------------------------------------------------------------------ request
@@ -335,11 +344,8 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         if not self.is_output_rank:
             return None
 
-        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
-        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
-        image = (image.float() * ps + pm).clamp(0, 1)
-        # The released pipeline quantizes to 8 bits by truncation, then resizes the 8-bit image.
-        image = (image * 255).clamp(0, 255).to(torch.uint8)
+        # ``image`` is already the uint8 canvas (de-normalized and truncated on device); the
+        # released pipeline then resizes the 8-bit image.
         if (out_h, out_w) != tuple(image.shape[-2:]):
             from PIL import Image
 
@@ -353,35 +359,52 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         # uint8 [1, 3, H, W]: 4x less to ship back to the engine than float.
         return image.contiguous()
 
+    def _gather_tiles(self, out: torch.Tensor) -> torch.Tensor:
+        """All ranks' decoded tiles, in ``cp_rank * tp + tp_rank`` slot order (in-graph)."""
+        if self.tp_size > 1:
+            out = tp_all_gather_rows(out.reshape(1, out.shape[0], -1), self._tp_group, self.tp_size).reshape(
+                -1, *out.shape[1:]
+            )
+        if self.cp_size > 1:
+            out = get_sp_group().all_gather(out.contiguous(), dim=0)
+        return out
+
     def _decode(self, latents: torch.Tensor, lh: int, lw: int) -> torch.Tensor | None:
+        """Tile-parallel VAE decode; returns the uint8 ``[1, 3, H, W]`` canvas on the output rank."""
         vae = self.vae
         z = unpatchify(latents, lh, lw) * vae.latents_std + vae.latents_mean
         slices, (ny, nx), yo, xo = plan_tiles(lh, lw)
         n = len(slices)
         per = math.ceil(n / self.world)
+        slot = self.cp_rank * self.tp_size + self.tp_rank if self.world == self.tp_size * self.cp_size else self.rank
         th, tw = slices[0][1], slices[0][3]
         batch = torch.zeros(per, vae.latent_channels, th, tw, dtype=torch.float32)
-        for j, t in enumerate(range(self.rank * per, min(n, (self.rank + 1) * per))):
+        for j, t in enumerate(range(slot * per, min(n, (slot + 1) * per))):
             y, hh, x, ww = slices[t]
             batch[j] = z[0, :, y : y + hh, x : x + ww]
         cos, sin = vae.rope_tables(th, tw)
         t0 = time.perf_counter()
-        out = self._vae_fn(batch.to(self.device), cos.to(self.device), sin.to(self.device)).cpu()
+        out = self._vae_fn(batch.to(self.device), cos.to(self.device), sin.to(self.device))
+        if self.world == self.tp_size * self.cp_size:
+            tiles = self._gather_fn(out)
+        else:  # unusual layouts: host gather
+            host = out.cpu()
+            gathered = [torch.empty_like(host) for _ in range(self.world)] if self.is_output_rank else None
+            dist.gather(host, gathered, dst=0)
+            tiles = torch.cat(gathered).to(self.device) if self.is_output_rank else None
+        if not self.is_output_rank:
+            return None
+        tiles = tiles.cpu()  # one D2H copy of every tile (bf16, the decoder's output dtype)
         t1 = time.perf_counter()
-        if self.world == 1:
-            tiles = out[:n]
-        else:
-            gathered = [torch.empty_like(out) for _ in range(self.world)] if self.is_output_rank else None
-            dist.gather(out, gathered, dst=0)
-            if not self.is_output_rank:
-                return None
-            tiles = torch.cat(gathered)[:n]
-        t2 = time.perf_counter()
-        grid = [[tiles[i * nx + j : i * nx + j + 1].float() for j in range(nx)] for i in range(ny)]
-        image = stitch_tiles(grid, yo, xo)
+        image = stitch_tiles_direct(tiles[:n].float(), ny, nx, yo, xo)
+        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
+        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
+        image.mul_(ps).add_(pm).clamp_(0, 1).mul_(255)
+        # The released pipeline quantizes to 8 bits by truncation.
+        image = image.clamp_(0, 255).to(torch.uint8)
         logger.info(
-            "VAE decode: %d tiles, device %.3fs, gather %.3fs, stitch %.3fs",
-            n, t1 - t0, t2 - t1, time.perf_counter() - t2,
+            "VAE decode: %d tiles, decode+gather+D2H %.3fs, stitch+8-bit %.3fs",
+            n, t1 - t0, time.perf_counter() - t1,
         )
         return image
 

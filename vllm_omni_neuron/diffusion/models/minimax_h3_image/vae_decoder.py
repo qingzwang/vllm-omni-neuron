@@ -213,7 +213,7 @@ def split_tiles(length: int, tile: int = TILE, min_overlap: int = TILE_OVERLAP, 
 
 def _blend(a, b, extent, dim):
     extent = min(a.shape[dim], b.shape[dim], extent)
-    pos = torch.arange(extent, dtype=b.dtype)
+    pos = torch.arange(extent, dtype=b.dtype, device=b.device)
     shape = [1] * a.ndim
     shape[dim] = extent
     wa = (1 - pos / extent).view(shape)
@@ -257,3 +257,44 @@ def plan_tiles(latent_height: int, latent_width: int, ratio: int = 16):
         for j_pos, j_len in zip(xs, xl):
             slices.append((i_pos // ratio, i_len // ratio, j_pos // ratio, j_len // ratio))
     return slices, (len(ys), len(xs)), yo, xo
+
+
+def stitch_tiles_direct(tiles: torch.Tensor, ny: int, nx: int, h_overlaps, w_overlaps) -> torch.Tensor:
+    """Same result as :func:`stitch_tiles` (the reference blend), written straight into one
+    output buffer instead of hundreds of small blends and concatenations.
+
+    For tile ``(i, j)`` (local row ``r``, column ``c`` of its output cell) the reference
+    computes ``V = r < eh ? (1 - r/eh) * T[i-1, j][H - eh + r] + (r/eh) * T[i, j][r] : T[i, j]``,
+    then ``out = c < ew ? (1 - c/ew) * T[i, j-1][:, W - ew + c] + (c/ew) * V : V`` -- note the left
+    neighbour enters *un*-blended -- and crops the bottom/right overlaps.
+    ``tiles``: ``[ny * nx, C, th, tw]`` fp32 in row-major tile order.
+    """
+    _, ch, th, tw = tiles.shape
+    rows_out = [th - (h_overlaps[i] if i < ny - 1 else 0) for i in range(ny)]
+    cols_out = [tw - (w_overlaps[j] if j < nx - 1 else 0) for j in range(nx)]
+    out = torch.empty(1, ch, sum(rows_out), sum(cols_out), dtype=tiles.dtype)
+    T = lambda i, j: tiles[i * nx + j]
+    y0 = 0
+    for i in range(ny):
+        hr = rows_out[i]
+        eh = min(th, h_overlaps[i - 1]) if i > 0 else 0
+        a = torch.ones(hr, 1, dtype=tiles.dtype)
+        if eh:
+            a[:eh, 0] = torch.arange(eh, dtype=tiles.dtype) / eh
+        x0 = 0
+        for j in range(nx):
+            wc = cols_out[j]
+            ew = min(tw, w_overlaps[j - 1]) if j > 0 else 0
+            b = torch.ones(1, wc, dtype=tiles.dtype)
+            if ew:
+                b[0, :ew] = torch.arange(ew, dtype=tiles.dtype) / ew
+            cell = out[0, :, y0 : y0 + hr, x0 : x0 + wc]
+            v = T(i, j)[:, :hr, :wc] * a
+            if eh:
+                v[:, :eh] += T(i - 1, j)[:, th - eh : th - eh + eh, :wc] * (1 - a[:eh])
+            torch.mul(v, b, out=cell)
+            if ew:
+                cell[:, :, :ew] += T(i, j - 1)[:, :hr, tw - ew :] * (1 - b[:, :ew])
+            x0 += wc
+        y0 += hr
+    return out
