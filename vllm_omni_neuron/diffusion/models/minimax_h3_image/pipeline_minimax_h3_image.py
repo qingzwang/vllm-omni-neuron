@@ -63,6 +63,7 @@ DEFAULT_EDIT_TEXT_BUCKETS = (2048, 4096, 8192, 16384)
 REFERENCE_SHORT_EDGE = (1024, 2048)  # VAE copy of a reference
 VISION_SHORT_EDGE = (1024, 1024)  # vision-tower copy of a reference
 MAX_REFERENCES = 16
+VAE_ENCODE_MAX_BATCH = 8  # reference tiles per encoder call
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
 HOST_POSTPROCESS_THREADS = int(os.environ.get("MINIMAX_H3_IMAGE_HOST_THREADS", "32"))
@@ -104,6 +105,10 @@ def _resolve_text_encoder_path(model_path: str) -> str:
     from huggingface_hub import snapshot_download
 
     return os.path.join(snapshot_download(repo, allow_patterns=["text_encoder/*"]), "text_encoder")
+
+
+def _cat0(parts):
+    return torch.cat(list(parts), dim=0)
 
 
 def get_minimax_h3_image_post_process_func(od_config):
@@ -193,6 +198,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self._text_fn = self.transformer.prepare_text
         self._vae_fn = self.vae.forward
         self._gather_fn = self._gather_tiles
+        self._cat_fn = _cat0
         self.tp_size = self.transformer.tp_size
         self.tp_rank = self.transformer.tp_rank
         self._tp_group = get_tp_group().device_group
@@ -263,6 +269,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.transformer.compile_step(comp)
         self._vae_fn = comp(self.vae.forward, "vae_decode")
         self._gather_fn = comp(self._gather_tiles, "vae_gather")
+        self._cat_fn = comp(_cat0, "cat_tiles")
         self._venc_fn = comp(self.vae_encoder.forward, "vae_encode") if hasattr(self, "vae_encoder") else None
         self._venc_comp = comp
         self._comp_fn = comp
@@ -391,7 +398,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         batch = torch.zeros(per, 3, 256, 256, dtype=torch.float32)
         for j, t in enumerate(range(slot * per, min(n, (slot + 1) * per))):
             batch[j] = tiles[t]
-        out = self._venc_fn(batch.to(self.device))
+        # Bounded per-call batch: 256-pixel fp32 activations of more tiles exceed per-core HBM.
+        chunk = min(per, VAE_ENCODE_MAX_BATCH)
+        outs = [self._venc_fn(batch[i : i + chunk].to(self.device)) for i in range(0, per, chunk)]
+        out = outs[0] if len(outs) == 1 else self._cat_fn(outs)
         if self.world == self.tp_size * self.cp_size and self.world > 1:
             all_tiles = self._gather_fn(out)
         else:

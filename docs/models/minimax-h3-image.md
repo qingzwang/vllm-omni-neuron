@@ -205,6 +205,20 @@ Example from the checkpoint (`examples/reference1.png`, `examples/prompt.edit.tx
 | 8 | **5.09 s** | 0.73 s | 4.02 s | 0.20 s | 36.6 dB |
 | 16 | **4.33 s** | 0.68 s | 3.33 s | 0.15 s | 34.3 dB |
 
+Three references with different aspect ratios (1536x1024, 1024x1536, 3000x1687 VAE copies;
+4977 presentation tokens, 20480 packed rows on Neuron), seed 7, 2048x2048 canvas:
+
+| Cores | Request | Host + vision + VAE encode | Denoise (6 steps) | VAE decode |
+|---|---|---|---|---|
+| 8 | **21.6 s** | 4.4 s | 16.8 s | 0.20 s |
+| 16 | **12.6 s** | 3.5 s | 8.6 s | 0.15 s |
+
+Teacher-forced target velocity against the CPU reference stays at rel 1.2-4.5e-2 (cosine
+>= 0.9990) at every step. The free-running images show the same edit (same subjects, scene and
+lighting) with small pose/layout differences, so their PSNR against the reference is low
+(~16 dB); with ~5k vision tokens the trajectory is more sensitive than in the single-reference
+case.
+
 Accuracy per component against the CPU reference: text-row embeddings mean cosine 0.9996
 (vision rows 0.993, the same spread the CPU reference shows against itself across thread
 counts), reference VAE encode rel 3e-7, teacher-forced target velocity rel 1.1-2.2e-2.
