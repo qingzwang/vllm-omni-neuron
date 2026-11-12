@@ -133,3 +133,81 @@ def build_layout(
         position_ids=position_ids,
         text_token_tags=text_token_tags,
     )
+
+
+@dataclass
+class EditLayout:
+    """Physical ``[target | references | text | padding]`` layout of an edit.
+
+    The graph's source rows are ``cat(target rows, reference rows padded to ref_pad,
+    text rows padded to text_pad)``; ``perm`` maps each physical row to its source row.
+    """
+
+    num_target: int
+    num_ref: int
+    ref_pad: int
+    num_text: int
+    text_pad: int
+    position_ids: torch.Tensor  # [total, 3] float64, physical order
+    tabs: torch.Tensor  # [total] int32 modulation table index per physical row
+    perm: torch.Tensor  # [total] int64
+
+    @property
+    def total(self) -> int:
+        return self.num_target + self.ref_pad + self.text_pad
+
+    @property
+    def kv_len(self) -> int:
+        return self.num_target + self.num_ref + self.num_text
+
+
+REF_ALIGN = 1024
+
+
+def build_edit_layout(
+    text_token_tags: list[int],
+    text_pad: int,
+    reference_grids: list[tuple[int, int]],
+    latent_height: int,
+    latent_width: int,
+    tab_target: int,
+    tab_reference: int,
+    tab_text: int,
+    image_tag: int = 0,
+    patch_h: int = 2,
+    patch_w: int = 2,
+    ref_pad: int | None = None,
+) -> EditLayout:
+    num_text = len(text_token_tags)
+    n_t = (latent_height // patch_h) * (latent_width // patch_w)
+    ref_rows = [(h // patch_h) * (w // patch_w) for h, w in reference_grids]
+    n_r = sum(ref_rows)
+    if ref_pad is None:
+        ref_pad = -(-n_r // REF_ALIGN) * REF_ALIGN
+    total = n_t + ref_pad + text_pad
+    pos = torch.zeros(total, 3, dtype=torch.float64)
+    tabs = torch.full((total,), tab_text, dtype=torch.int32)
+    # Reference clock: text rows 0..T-1, then one integer slot per reference, then the target.
+    rotary_time = float(num_text)
+    cur = n_t
+    for (h, w), n in zip(reference_grids, ref_rows):
+        pos[cur : cur + n, 0] = rotary_time
+        pos[cur : cur + n, 1:] = _frame_position_grid(h, w, patch_h, patch_w)
+        tabs[cur : cur + n] = tab_reference
+        cur += n
+        rotary_time += 1.0
+    pos[:n_t, 0] = rotary_time
+    pos[:n_t, 1:] = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+    tabs[:n_t] = tab_target
+    t0 = n_t + n_r
+    pos[t0 : t0 + num_text, 0] = torch.arange(num_text, dtype=torch.float64)
+    tt = torch.tensor(text_token_tags)
+    tabs[t0 : t0 + num_text] = torch.where(tt == image_tag, tab_target, tab_text).to(torch.int32)
+    src_text = n_t + ref_pad
+    perm = torch.cat([
+        torch.arange(0, n_t + n_r),                                   # target, real references
+        torch.arange(src_text, src_text + num_text),                  # real text
+        torch.arange(n_t + n_r, n_t + ref_pad),                       # reference padding
+        torch.arange(src_text + num_text, src_text + text_pad),       # text padding
+    ])
+    return EditLayout(n_t, n_r, ref_pad, num_text, text_pad, pos, tabs, perm)

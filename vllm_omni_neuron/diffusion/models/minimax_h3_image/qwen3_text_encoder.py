@@ -215,10 +215,16 @@ class NeuronQwen3TextEncoder(nn.Module):
                 self._embed = fh.get_tensor(key).to(torch.bfloat16)
         return F.embedding(token_ids, self._embed)
 
-    def forward(self, inputs_embeds: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs_embeds: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, deepstack: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``deepstack`` ``[n, T, H]`` (vision presentations): added after decoder layers ``0..n-1``
+        (zero outside the vision rows), as Qwen3-VL's ``_deepstack_process`` does."""
         x = inputs_embeds
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin)
+            if deepstack is not None and i < deepstack.shape[0]:
+                x = x + deepstack[i][None]
         return x
 
     def load_weights(self, device: torch.device) -> None:

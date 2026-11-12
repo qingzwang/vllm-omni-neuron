@@ -516,6 +516,11 @@ def _segment_select(x, segments, base, fn):
     row masks keeps the tensor whole: slicing the segments apart and concatenating them back
     costs ~3 ms per block at 4352 tokens/core (the copies break the compiler's matmul layouts).
     """
+    if isinstance(segments, torch.Tensor):
+        # Runtime per-row table index (edits): ``segments`` is ``[1, rows, 1]`` int32.
+        out = fn(x, TAB_TEXT)
+        out = torch.where(segments == TAB_TARGET, fn(x, TAB_TARGET), out)
+        return torch.where(segments == TAB_REFERENCE, fn(x, TAB_REFERENCE), out)
     if len(segments) == 1:
         return fn(x, segments[0][2])
     rows = torch.arange(x.shape[1], device=x.device)[None, :, None] + base
@@ -657,9 +662,10 @@ class _BlockGroup(nn.Module):
     def set_segments(self, segments, base) -> None:
         self.segments, self.base = list(segments), int(base)
 
-    def forward(self, x, mods, cos, sin, kv_len):
+    def forward(self, x, mods, cos, sin, kv_len, tabs=None):
+        segments = self.segments if tabs is None else tabs
         for j, block in enumerate(self.blocks):
-            x = block(x, mods[j], cos, sin, kv_len, self.segments, self.base)
+            x = block(x, mods[j], cos, sin, kv_len, segments, self.base)
         return x
 
 
@@ -783,10 +789,16 @@ class MiniMaxH3ImageTransformer(nn.Module):
         k = self.layers_per_graph
         return [block_mods[g * k : (g + 1) * k].contiguous() for g in range(len(self.blocks) // k)]
 
-    def embed(self, image_rows: torch.Tensor, text_hidden: torch.Tensor) -> torch.Tensor:
-        """Packed ``[image | text]`` sequence, this CP rank's ``[1, S_local, H]`` bf16 chunk."""
+    def embed(self, image_rows: torch.Tensor, text_hidden: torch.Tensor, perm: torch.Tensor | None = None) -> torch.Tensor:
+        """Packed ``[image | text]`` sequence, this CP rank's ``[1, S_local, H]`` bf16 chunk.
+
+        ``perm`` (edits, ``[total]`` int): physical row ``i`` takes source row ``perm[i]`` of
+        ``cat(image_rows, text_hidden)``, so that every padding row ends up at the end.
+        """
         image_embeds = torch.matmul(image_rows.float(), self.proj_in_weight) + self.proj_in_bias
         x = torch.cat([image_embeds.to(torch.bfloat16), text_hidden.to(torch.bfloat16)], dim=1)
+        if perm is not None:
+            x = x.index_select(1, perm)
         total = x.shape[1]
         if total % self.cp_size:
             raise ValueError(f"packed length {total} is not divisible by CP={self.cp_size}")
@@ -798,9 +810,9 @@ class MiniMaxH3ImageTransformer(nn.Module):
             x = x[:, self.tp_rank * n : (self.tp_rank + 1) * n]
         return x
 
-    def run_group(self, x, mods, cos, sin, kv_len, params):
+    def run_group(self, x, mods, cos, sin, kv_len, params, tabs=None):
         """One group of ``layers_per_graph`` blocks, weights given by ``params``."""
-        return torch.func.functional_call(self._group_template, params, (x, mods, cos, sin, kv_len))
+        return torch.func.functional_call(self._group_template, params, (x, mods, cos, sin, kv_len, tabs))
 
     def finalize(self, x, out_mod, head_weight, head_bias):
         """Output norm + this step's PDD head; ``[1, total, patch_dim]`` fp32 (CP-gathered)."""
@@ -851,6 +863,8 @@ class MiniMaxH3ImageTransformer(nn.Module):
         head_weight: torch.Tensor,
         head_bias: torch.Tensor,
         step: int | None = None,
+        tabs: torch.Tensor | None = None,
+        perm: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One denoising step (host orchestration of the compiled pieces).
 
@@ -882,7 +896,7 @@ class MiniMaxH3ImageTransformer(nn.Module):
         embed = getattr(self, "_embed_fn", self.embed)
         run = getattr(self, "_group_fn", self.run_group)
         final = getattr(self, "_final_fn", self.finalize)
-        x = embed(image_rows, text_hidden)
+        x = embed(image_rows, text_hidden) if perm is None else embed(image_rows, text_hidden, perm)
         cache_steps = getattr(self, "cache_steps", frozenset())
         g0, g1 = getattr(self, "cache_groups", (0, 0))
         reuse = step in cache_steps and self._cache_residual is not None
@@ -894,7 +908,10 @@ class MiniMaxH3ImageTransformer(nn.Module):
                     g = g1
                     continue
                 x_in = x
-            x = run(x, group_mods[g], cos, sin, kv_len, self._group_params[g])
+            if tabs is None:
+                x = run(x, group_mods[g], cos, sin, kv_len, self._group_params[g])
+            else:
+                x = run(x, group_mods[g], cos, sin, kv_len, self._group_params[g], tabs)
             if cache_steps and not reuse and g == g1 - 1:
                 self._cache_residual = getattr(self, "_sub_fn", _sub)(x, x_in)
             g += 1

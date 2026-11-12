@@ -26,6 +26,9 @@ parser = argparse.ArgumentParser(description="MiniMax-H3-Image on Neuron")
 parser.add_argument("--model-path", default="MiniMaxAI/MiniMax-H3-Image")
 parser.add_argument("--stage-config", default=None)
 parser.add_argument("--prompt", default="A highland cow standing in a misty meadow at sunrise, photorealistic, detailed fur")
+parser.add_argument("--prompt-file", default=None, help="Read the prompt from a file (overrides --prompt)")
+parser.add_argument("--image", action="append", default=None,
+                    help="Reference image for editing; repeat for <Picture 2>, <Picture 3>, ...")
 parser.add_argument("--height", type=int, default=2048)
 parser.add_argument("--width", type=int, default=2048)
 parser.add_argument("--min-generation-area", type=int, default=2048 * 2048)
@@ -76,14 +79,20 @@ def main():
         seed=args.seed,
         extra_args={"min_generation_area": args.min_generation_area},
     )
+    prompt = open(args.prompt_file).read() if args.prompt_file else args.prompt
+    request = {"prompt": prompt}
+    if args.image:
+        from PIL import Image
+
+        request["multi_modal_data"] = {"image": [Image.open(p) for p in args.image]}
     t0 = time.perf_counter()
-    result = omni.generate({"prompt": args.prompt}, params)
+    result = omni.generate(request, params)
     print(f"first generation (includes compilation on a cold cache): {time.perf_counter() - t0:.2f}s")
     if args.profile:
         times = []
         for i in range(args.profile_runs):
             t0 = time.perf_counter()
-            result = omni.generate({"prompt": args.prompt}, params)
+            result = omni.generate(request, params)
             times.append(time.perf_counter() - t0)
             print(f"[profile] run {i + 1}: {times[-1]:.3f}s")
         print(f"[profile] {args.height}x{args.width}: avg {sum(times) / len(times):.3f}s min {min(times):.3f}s")

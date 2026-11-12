@@ -33,7 +33,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 
-from .layout import build_layout, choose_text_pad, get_image_canvas_size, patchify, unpatchify
+from .layout import build_edit_layout, build_layout, choose_text_pad, get_image_canvas_size, patchify, unpatchify
 from vllm.distributed.parallel_state import get_tp_group
 
 from .minimax_h3_image_transformer import (
@@ -44,6 +44,9 @@ from .minimax_h3_image_transformer import (
     MiniMaxH3ImageConfig,
     MiniMaxH3ImageTimeTables,
     MiniMaxH3ImageTransformer,
+    TAB_REFERENCE,
+    TAB_TARGET,
+    TAB_TEXT,
     build_rope_tables,
 )
 from .qwen3_text_encoder import TEXT_ENCODER_LAYER, NeuronQwen3TextEncoder
@@ -55,6 +58,11 @@ DEFAULT_SIZE = 2048
 DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
 MAX_SEQUENCE_LENGTH = 4096
 DEFAULT_TEXT_BUCKETS = (256, 512, 1024, 2048, 4096)
+# Edit presentations carry a vision block per reference (~1k tokens at the 1024 short edge).
+DEFAULT_EDIT_TEXT_BUCKETS = (2048, 4096, 8192, 16384)
+REFERENCE_SHORT_EDGE = (1024, 2048)  # VAE copy of a reference
+VISION_SHORT_EDGE = (1024, 1024)  # vision-tower copy of a reference
+MAX_REFERENCES = 16
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
 HOST_POSTPROCESS_THREADS = int(os.environ.get("MINIMAX_H3_IMAGE_HOST_THREADS", "32"))
@@ -169,6 +177,10 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         vae_dtype = getattr(torch, str(overrides.get("vae_dtype", "bfloat16")))
         self.vae = NeuronMiniMaxH3ImageVAEDecoder(os.path.join(mp, "vae_diffusers"), dtype=vae_dtype)
         self.text_buckets = [int(b) for b in overrides.get("text_buckets", DEFAULT_TEXT_BUCKETS)]
+        self.edit_text_buckets = [int(b) for b in overrides.get("edit_text_buckets", DEFAULT_EDIT_TEXT_BUCKETS)]
+        self._te_path = self.text_encoder.model_path
+        self._vae_path = os.path.join(mp, "vae_diffusers")
+        self._edit_host = None  # (vision host, VAE encoder, processor), built on first edit (rank 0)
 
         sp = get_sp_group()
         self.cp_size, self.cp_rank = sp.world_size, sp.rank_in_group
@@ -244,6 +256,141 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
     # ------------------------------------------------------------------ request
 
     @staticmethod
+    def _images_of(raw):
+        """Reference images of an edit request (``multi_modal_data["image"]``), or None."""
+        if isinstance(raw, str):
+            return None
+        mm = raw.get("multi_modal_data") or {}
+        imgs = mm.get("image")
+        if imgs is None:
+            return None
+        imgs = imgs if isinstance(imgs, (list, tuple)) else [imgs]
+        return list(imgs) or None
+
+    # ------------------------------------------------------------------ edits
+
+    def _edit_host_models(self):
+        if self._edit_host is None:
+            from transformers import AutoProcessor
+
+            from .qwen3_vision_host import Qwen3VLVisionHost
+            from .vae_encoder import MiniMaxH3ImageVAEEncoder
+
+            vision = Qwen3VLVisionHost(self._te_path)
+            vision.load_weights()
+            enc = MiniMaxH3ImageVAEEncoder(self._vae_path)
+            enc.load_weights()
+            enc.eval()
+            proc = AutoProcessor.from_pretrained(os.path.join(self.model_path, "processor"))
+            self._edit_host = (vision, enc, proc)
+        return self._edit_host
+
+    def _edit_inputs(self, prompt: str, images, sp, lh: int, lw: int) -> dict:
+        """Host side of an edit, computed on rank 0 and broadcast (reference order of RNG draws:
+        one posterior sample per reference, then the target noise, then the reference noise)."""
+        cfg = self.transformer.config
+        meta = [None]
+        if self.rank == 0:
+            prev = torch.get_num_threads()
+            torch.set_num_threads(HOST_POSTPROCESS_THREADS)
+            try:
+                payload = self._edit_inputs_rank0(prompt, images, sp, lh, lw)
+            finally:
+                torch.set_num_threads(prev)
+            meta[0] = {k: v for k, v in payload.items() if not isinstance(v, torch.Tensor)}
+            meta[0]["shapes"] = {k: (tuple(v.shape), str(v.dtype)) for k, v in payload.items() if isinstance(v, torch.Tensor)}
+        if self.world > 1:
+            dist.broadcast_object_list(meta, src=0)
+        if self.rank != 0:
+            payload = dict(meta[0])
+            for k, (shape, dt) in meta[0]["shapes"].items():
+                payload[k] = torch.empty(shape, dtype=getattr(torch, dt.split(".")[-1]))
+        if self.world > 1:
+            for k in sorted(meta[0]["shapes"]):
+                dist.broadcast(payload[k], src=0)
+        del cfg
+        return payload
+
+    def _edit_inputs_rank0(self, prompt, images, sp, lh, lw) -> dict:
+        import numpy as np
+        from diffusers.image_processor import VaeImageProcessor
+        from PIL import Image, ImageOps
+
+        from .minimax_h3_image_transformer import IMAGE_TAG as _IMG, TEXT_TAG as _TXT
+
+        if len(images) > MAX_REFERENCES:
+            raise ValueError(f"MiniMax-H3-Image accepts at most {MAX_REFERENCES} reference images, got {len(images)}")
+        vision, enc, proc = self._edit_host_models()
+        ip = VaeImageProcessor(vae_scale_factor=16, do_normalize=False)
+        pil = []
+        for im in images:
+            if not isinstance(im, Image.Image):
+                im = Image.open(im)
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            if min(im.size) < 32:
+                raise ValueError(f"A reference image needs at least 32 pixels on each side, got {im.size}")
+            pil.append(im)
+
+        def bound(image, lo, hi):
+            w, h = image.size
+            short = min(w, h)
+            if lo <= short <= hi:
+                return image
+            sc = (lo if short < lo else hi) / short
+            size = (max(32, round(w * sc / 32) * 32), max(32, round(h * sc / 32) * 32))
+            return ip.resize(image, height=size[1], width=size[0])
+
+        ref_imgs = [bound(im, *REFERENCE_SHORT_EDGE) for im in pil]
+        vis_imgs = [bound(im, *VISION_SHORT_EDGE) for im in pil]
+        # presentation: "Picture i: " + vision block per reference, then the prompt (no template)
+        tok = self.tokenizer
+        vin = proc.image_processor(images=vis_imgs, return_tensors="pt")
+        merge = proc.image_processor.merge_size ** 2
+        token_ids, tags = [], []
+        for i, grid in enumerate(vin["image_grid_thw"]):
+            label = tok(f"Picture {i + 1}: ", add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+            vids = ([tok.convert_tokens_to_ids("<|vision_start|>")]
+                    + [tok.convert_tokens_to_ids("<|image_pad|>")] * (int(grid.prod()) // merge)
+                    + [tok.convert_tokens_to_ids("<|vision_end|>")])
+            token_ids += label + vids
+            tags += [_TXT] * len(label) + [_IMG] * len(vids)
+        pids = tok(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+        token_ids += pids
+        tags += [_TXT] * len(pids)
+
+        # VAE encode: posterior sample (generator), fp16 round, crop to whole patches, normalize
+        gen = self._generator(sp)
+        ref_latents = []
+        pm = torch.tensor(PIXEL_MEAN, dtype=torch.float32).view(1, -1, 1, 1)
+        ps = torch.tensor(PIXEL_STD, dtype=torch.float32).view(1, -1, 1, 1)
+        for im in ref_imgs:
+            px = torch.from_numpy(np.array(im)).permute(2, 0, 1)[None]
+            px = px[..., : px.shape[-2] // 16 * 16, : px.shape[-1] // 16 * 16]
+            px = (px.float().div(255.0) - pm) / ps
+            lat = enc.sample(enc.encode_moments(px), gen).to(torch.float16).float()
+            lat = lat[..., : lat.shape[-2] // 2 * 2, : lat.shape[-1] // 2 * 2]
+            ref_latents.append((lat - enc.latents_mean) / enc.latents_std)
+        noise = torch.randn((1, self.transformer.config.in_channels, 1, lh, lw), generator=gen, dtype=torch.float32)
+        ref_rows = []
+        for lat in ref_latents:
+            nz = torch.randn(lat.shape, generator=gen, dtype=torch.float32)
+            t = torch.tensor(REFERENCE_NOISE_AUG, dtype=torch.float32)
+            ref_rows.append(patchify(t * lat + (1.0 - t) * nz))
+        ref_rows = torch.cat(ref_rows)
+        n_ref = ref_rows.shape[0]
+        n_t = (lh // 2) * (lw // 2)
+        ref_pad = -(-n_ref // 1024) * 1024
+        text_pad = choose_text_pad(len(token_ids), n_t + ref_pad, self.cp_size, self.edit_text_buckets)
+        rows = torch.zeros(ref_pad, ref_rows.shape[1], dtype=torch.float32)
+        rows[:n_ref] = ref_rows
+        mm = proc.create_mm_token_type_ids([token_ids])[0]
+        emb, ds, cos, sin = vision.presentation_inputs(
+            token_ids, mm, vin["pixel_values"], vin["image_grid_thw"], self.text_encoder.embed, text_pad)
+        return dict(num_text=len(token_ids), text_pad=text_pad, token_tags=tags,
+                    grids=[tuple(int(v) for v in r.shape[-2:]) for r in ref_latents], ref_pad=ref_pad,
+                    emb=emb, deepstack=ds, cos=cos, sin=sin, noise=noise, ref_rows=rows)
+
+    @staticmethod
     def _prompt_of(raw) -> str:
         if isinstance(raw, str):
             return raw
@@ -262,7 +409,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         return g
 
     @torch.no_grad()
-    def _generate_one(self, prompt: str, sp) -> torch.Tensor | None:
+    def _generate_one(self, prompt: str, sp, images=None) -> torch.Tensor | None:
         timings = {}
         t_all = time.perf_counter()
         extra = dict(getattr(sp, "extra_args", None) or {})
@@ -276,19 +423,28 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
 
         if not prompt:
             raise ValueError("MiniMax-H3-Image requires a non-empty prompt")
-        token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
-        num_text = len(token_ids)
         n_img = (lh // 2) * (lw // 2)
-        text_pad = choose_text_pad(num_text, n_img, self.cp_size, self.text_buckets)
         dev = self.device
+        edit = None
+        t0 = time.perf_counter()
+        if images:
+            edit = self._edit_inputs(prompt, images, sp, lh, lw)
+            num_text, text_pad = edit["num_text"], edit["text_pad"]
+            timings["edit_host_s"] = time.perf_counter() - t0
+        else:
+            token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"][:MAX_SEQUENCE_LENGTH]
+            num_text = len(token_ids)
+            text_pad = choose_text_pad(num_text, n_img, self.cp_size, self.text_buckets)
 
         # 1. text encoder
-        t0 = time.perf_counter()
-        ids = torch.zeros(1, text_pad, dtype=torch.long)
-        ids[0, :num_text] = torch.tensor(token_ids, dtype=torch.long)
-        emb = self.text_encoder.embed(ids)
-        te_cos, te_sin = self.text_encoder.rope_tables(text_pad)
-        prompt_embeds = self._te_fn(emb.to(dev), te_cos.to(dev), te_sin.to(dev))
+        if edit is None:
+            ids = torch.zeros(1, text_pad, dtype=torch.long)
+            ids[0, :num_text] = torch.tensor(token_ids, dtype=torch.long)
+            emb = self.text_encoder.embed(ids)
+            te_cos, te_sin = self.text_encoder.rope_tables(text_pad)
+            prompt_embeds = self._te_fn(emb.to(dev), te_cos.to(dev), te_sin.to(dev))
+        else:
+            prompt_embeds = self._te_fn(edit["emb"].to(dev), edit["cos"].to(dev), edit["sin"].to(dev), edit["deepstack"].to(dev))
         # 2. text stream (context_embedder + token_refiner)
         text_kv_len = torch.tensor([num_text], dtype=torch.int32).to(dev)
         text_hidden = self._text_fn(prompt_embeds, text_kv_len)
@@ -296,8 +452,15 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
 
         # 3. denoise
         t0 = time.perf_counter()
-        layout = build_layout(num_text, text_pad, [], lh, lw)
         cfg = self.transformer.config
+        tabs = perm = None
+        ref_rows = None
+        if edit is None:
+            layout = build_layout(num_text, text_pad, [], lh, lw)
+        else:
+            layout = build_edit_layout(edit["token_tags"], text_pad, edit["grids"], lh, lw,
+                                       TAB_TARGET, TAB_REFERENCE, TAB_TEXT, ref_pad=edit["ref_pad"])
+            ref_rows = edit["ref_rows"]  # [ref_pad, patch_dim], noised to t = 0.999, held every step
         cos, sin = build_rope_tables(layout.position_ids, cfg)
         local = layout.total // self.cp_size
         lo = self.cp_rank * local
@@ -305,9 +468,18 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         sin_l = sin[lo : lo + local].to(torch.bfloat16).to(dev)
         kv_len = torch.tensor([layout.kv_len], dtype=torch.int32).to(dev)
         self.transformer.set_layout(0)
+        if edit is not None:
+            rows_of_rank = layout.tabs[lo : lo + local]
+            if self.transformer.sequence_parallel:
+                n_sh = local // self.tp_size
+                rows_of_rank = rows_of_rank[self.tp_rank * n_sh : (self.tp_rank + 1) * n_sh]
+            tabs = rows_of_rank.view(1, -1, 1).to(dev)
+            perm = layout.perm.to(dev)
 
         latents_in = getattr(sp, "latents", None)
-        if latents_in is not None:
+        if edit is not None:
+            noise = edit["noise"]
+        elif latents_in is not None:
             noise = latents_in.to(torch.float32).reshape(1, cfg.in_channels, 1, lh, lw)
         else:
             noise = torch.randn((1, cfg.in_channels, 1, lh, lw), generator=self._generator(sp), dtype=torch.float32)
@@ -315,10 +487,12 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
         self.transformer.reset_step_cache()
         for i in range(len(self.timesteps)):
             mods, out_mod, head_w, head_b = self._step_tables[i]
+            rows = latents[None] if ref_rows is None else torch.cat([latents, ref_rows])[None]
             v = self.transformer(
-                latents[None].to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b, step=i
+                rows.to(dev), text_hidden, cos_l, sin_l, kv_len, mods, out_mod, head_w, head_b, step=i,
+                tabs=tabs, perm=perm,
             )
-            v = v.cpu()[0, :n_img].float()
+            v = v.cpu()[0, :n_img].float()  # the generated rows come first in both layouts
             latents = latents + (self.sigmas[i] - self.sigmas[i + 1]) * v
         timings["denoise_s"] = time.perf_counter() - t0
 
@@ -414,7 +588,7 @@ class NeuronMiniMaxH3ImagePipeline(nn.Module):
             return [DiffusionOutput(output=None) for _ in range(req.num_reqs)]
         outputs = []
         for raw, sp in zip(req.prompts, req.sampling_params_list):
-            image = self._generate_one(self._prompt_of(raw), sp)
+            image = self._generate_one(self._prompt_of(raw), sp, self._images_of(raw))
             outputs.append(DiffusionOutput(output=image))
         return outputs
 
