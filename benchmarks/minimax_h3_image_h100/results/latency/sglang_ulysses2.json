@@ -1,0 +1,310 @@
+{
+ "1024_native": {
+  "size": "1024x1024",
+  "native_canvas": true,
+  "latencies_s": [
+   0.36629401200025313,
+   0.36680009700012306,
+   0.3649792470000648,
+   0.3732228599997143,
+   0.3663852559998304
+  ],
+  "median_s": 0.3663852559998304,
+  "mean_s": 0.36753629439999713,
+  "min_s": 0.3649792470000648,
+  "max_s": 0.3732228599997143,
+  "png_mb": 3.14706,
+  "image_size": [
+   1024,
+   1024
+  ],
+  "server_extra": [
+   {
+    "id": "4581660a-f96e-4110-8aa2-bd4989e610c2",
+    "created": 1794472839,
+    "peak_memory_mb": 67870.0,
+    "inference_time_s": 0.3429796539999188,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/4581660a-f96e-4110-8aa2-bd4989e610c2.png",
+    "resize": null
+   },
+   {
+    "id": "19641ee1-4ee0-4e62-9bc8-cae7ba3e34b5",
+    "created": 1794472839,
+    "peak_memory_mb": 67870.0,
+    "inference_time_s": 0.3438366259997565,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/19641ee1-4ee0-4e62-9bc8-cae7ba3e34b5.png",
+    "resize": null
+   },
+   {
+    "id": "0f543f79-933e-420f-b0d1-829f0873b801",
+    "created": 1794472839,
+    "peak_memory_mb": 67870.0,
+    "inference_time_s": 0.3424063060001572,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/0f543f79-933e-420f-b0d1-829f0873b801.png",
+    "resize": null
+   },
+   {
+    "id": "0739bb94-bf87-49bc-93e7-9da78baaf7f8",
+    "created": 1794472840,
+    "peak_memory_mb": 67870.0,
+    "inference_time_s": 0.34922978000031435,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/0739bb94-bf87-49bc-93e7-9da78baaf7f8.png",
+    "resize": null
+   },
+   {
+    "id": "09ebc677-4241-4670-9863-02ffa5dd5f34",
+    "created": 1794472840,
+    "peak_memory_mb": 67870.0,
+    "inference_time_s": 0.34383499600016876,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/09ebc677-4241-4670-9863-02ffa5dd5f34.png",
+    "resize": null
+   }
+  ]
+ },
+ "1024_default": {
+  "size": "1024x1024",
+  "native_canvas": false,
+  "latencies_s": [
+   1.2321291769999334,
+   1.2445009110001592,
+   1.240680755000085,
+   1.2407835899998645,
+   1.242234069999995
+  ],
+  "median_s": 1.2407835899998645,
+  "mean_s": 1.2400657006000073,
+  "min_s": 1.2321291769999334,
+  "max_s": 1.2445009110001592,
+  "png_mb": 3.14706,
+  "image_size": [
+   1024,
+   1024
+  ],
+  "server_extra": [
+   {
+    "id": "d832240d-fb69-422c-96f1-3c854daf919d",
+    "created": 1794472844,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.20730398600017,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/d832240d-fb69-422c-96f1-3c854daf919d.png",
+    "resize": null
+   },
+   {
+    "id": "60c383b6-c7a2-4e15-a7d7-e2ebcb61541f",
+    "created": 1794472845,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.2210149449997516,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/60c383b6-c7a2-4e15-a7d7-e2ebcb61541f.png",
+    "resize": null
+   },
+   {
+    "id": "0d859d85-83f1-4bf1-9b9c-133607d3e9f7",
+    "created": 1794472846,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.2167481659998884,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/0d859d85-83f1-4bf1-9b9c-133607d3e9f7.png",
+    "resize": null
+   },
+   {
+    "id": "0b6098e1-8580-40e1-9284-263e65b3f655",
+    "created": 1794472848,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.217066942999736,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/0b6098e1-8580-40e1-9284-263e65b3f655.png",
+    "resize": null
+   },
+   {
+    "id": "5a0f7b7a-1b2b-43f7-8d8f-c59ce97af50e",
+    "created": 1794472849,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.2185722760000317,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/5a0f7b7a-1b2b-43f7-8d8f-c59ce97af50e.png",
+    "resize": null
+   }
+  ]
+ },
+ "2048": {
+  "size": "2048x2048",
+  "native_canvas": false,
+  "latencies_s": [
+   1.19844998499957,
+   1.193331317999764,
+   1.1908880660002978,
+   1.1970918890001485,
+   1.1926532919997044
+  ],
+  "median_s": 1.193331317999764,
+  "mean_s": 1.194482909999897,
+  "min_s": 1.1908880660002978,
+  "max_s": 1.19844998499957,
+  "png_mb": 12.585988,
+  "image_size": [
+   2048,
+   2048
+  ],
+  "server_extra": [
+   {
+    "id": "7c621145-e47c-4772-b9ad-8e359b05d69d",
+    "created": 1794472853,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.0712155159999384,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/7c621145-e47c-4772-b9ad-8e359b05d69d.png",
+    "resize": null
+   },
+   {
+    "id": "969bbe21-769f-4ea7-bdf3-240be279e418",
+    "created": 1794472854,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.0681669640002838,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/969bbe21-769f-4ea7-bdf3-240be279e418.png",
+    "resize": null
+   },
+   {
+    "id": "a19e61b1-1f91-4b00-a588-f259d02dc6f1",
+    "created": 1794472855,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.065944822000347,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/a19e61b1-1f91-4b00-a588-f259d02dc6f1.png",
+    "resize": null
+   },
+   {
+    "id": "ec76976b-cfef-4f68-9b37-081971e2aede",
+    "created": 1794472856,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.0713364050002383,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/ec76976b-cfef-4f68-9b37-081971e2aede.png",
+    "resize": null
+   },
+   {
+    "id": "5f68df60-dbd4-4ade-8d88-9811c69afe75",
+    "created": 1794472858,
+    "peak_memory_mb": 68408.0,
+    "inference_time_s": 1.0650681090000944,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/5f68df60-dbd4-4ade-8d88-9811c69afe75.png",
+    "resize": null
+   }
+  ]
+ },
+ "4096": {
+  "size": "4096x4096",
+  "native_canvas": false,
+  "latencies_s": [
+   6.090997882000011,
+   6.088617236000118,
+   6.121863118999954,
+   6.106482385999698,
+   6.11183501000005
+  ],
+  "median_s": 6.106482385999698,
+  "mean_s": 6.103959126599966,
+  "min_s": 6.088617236000118,
+  "max_s": 6.121863118999954,
+  "png_mb": 50.339652,
+  "image_size": [
+   4096,
+   4096
+  ],
+  "server_extra": [
+   {
+    "id": "94ebf435-40bb-4a16-a474-6a407985ac86",
+    "created": 1794472876,
+    "peak_memory_mb": 69868.0,
+    "inference_time_s": 5.264284196000062,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/94ebf435-40bb-4a16-a474-6a407985ac86.png",
+    "resize": null
+   },
+   {
+    "id": "78715188-d45e-4f6c-88ba-32b1ab21bfad",
+    "created": 1794472883,
+    "peak_memory_mb": 69532.0,
+    "inference_time_s": 5.259312962999957,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/78715188-d45e-4f6c-88ba-32b1ab21bfad.png",
+    "resize": null
+   },
+   {
+    "id": "bf0f1693-cb78-4a3b-bcc3-02ccc3f0b96e",
+    "created": 1794472890,
+    "peak_memory_mb": 69532.0,
+    "inference_time_s": 5.289012612000079,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/bf0f1693-cb78-4a3b-bcc3-02ccc3f0b96e.png",
+    "resize": null
+   },
+   {
+    "id": "53453c2a-dcb4-486a-a7e5-035f9379dfbe",
+    "created": 1794472896,
+    "peak_memory_mb": 69532.0,
+    "inference_time_s": 5.284936970000217,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/53453c2a-dcb4-486a-a7e5-035f9379dfbe.png",
+    "resize": null
+   },
+   {
+    "id": "89bf22b3-45d8-48c5-9164-074fdb1cf1a3",
+    "created": 1794472903,
+    "peak_memory_mb": 69532.0,
+    "inference_time_s": 5.2963259070002096,
+    "usage": null,
+    "url": null,
+    "revised_prompt": "The image is a photorealistic overhead food photograph capturing a rustic farm-to-table feast spread across a heavily weathered, dark brown wooden table with deep visible grain and scratches. The composition is a top-down view looking directly at the table surface. In the center sits a large woven jute placemat supporting a freshly baked rustic sourdough loaf with a deeply scored, golden-brown crust and a dusting of flour. To the upper left, a hammered copper bowl overflows with a colorful mix of fresh seasonal vegetables, including purple kale, bright orange carrots, red beets, and vibrant green salad leaves. In the upper right, a dark wooden cheese board holds neatly arranged artisanal cheeses: a wedge of bloomy rind brie with a creamy yellow interior, a wedge of aged cheddar with a golden rind, and a log of goat cheese sprinkled with cracked peppercorns and rosemary sprigs. The lower left contains a cluster of heirloom tomatoes, small cherry tomatoes on the vine, scattered toasted walnuts, and a small ceramic bowl of green olives. In the lower right, a clear glass wine glass filled with dark red wine sits beside a vintage brass candle holder with a lit white taper candle. A smaller wooden cutting board holding sliced apples and a wedge of brie overlaps the center of the table. The warm natural sunlight originates from the left, creating a realistic interplay of dappled shadows, crisp highlights on the polished glass and glossy tomatoes, and rich drop shadows that emphasize the rough wood grain and textured vegetables.",
+    "file_path": "/home/ubuntu/minimax-h3-image/outputs/89bf22b3-45d8-48c5-9164-074fdb1cf1a3.png",
+    "resize": null
+   }
+  ]
+ }
+}

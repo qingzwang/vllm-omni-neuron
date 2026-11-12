@@ -1,0 +1,164 @@
+diff --git a/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_image.py b/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_image.py
+index 3f4a17320..80b6b444c 100644
+--- a/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_image.py
++++ b/vllm_omni/diffusion/models/minimax_h3/pipeline_minimax_h3_image.py
+@@ -62,6 +62,34 @@ from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+ )
+ from vllm_omni.platforms import current_omni_platform
+ 
++
++# ---- H3_PROF: env-gated stage timing (set H3_PROF_FILE) ----
++import time as _h3_time
++
++
++class _H3Prof:
++    def __init__(self):
++        self.on = bool(os.environ.get("H3_PROF_FILE"))
++        self.marks: list[tuple[str, float]] = []
++        if self.on:
++            self.mark("start")
++
++    def mark(self, name: str) -> None:
++        if not self.on:
++            return
++        if torch.cuda.is_available():
++            torch.cuda.synchronize()
++        self.marks.append((name, _h3_time.time()))
++
++    def dump(self, **extra) -> None:
++        if not self.on:
++            return
++        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
++            return
++        with open(os.environ["H3_PROF_FILE"], "a") as f:
++            f.write(json.dumps({"kind": "pipeline", "marks": self.marks, **extra}) + "\n")
++
++
+ from .denoise_loop import (
+     MINIMAX_H3_AUDIO_ROW_WIDTH,
+     MINIMAX_H3_IMGVID_COND_TIMESTEP,
+@@ -677,6 +705,7 @@ class MiniMaxH3ImagePipeline(
+         latent_h: int,
+         latent_w: int,
+         num_steps: int,
++        prof: _H3Prof | None = None,
+     ) -> torch.Tensor:
+         text_len = int(hidden.shape[0])
+         blocks = [{"kind": "image", "latent_h": h, "latent_w": w} for h, w in grids]
+@@ -702,6 +731,8 @@ class MiniMaxH3ImagePipeline(
+         sigmas = minimax_h3_image_run_sigmas(self.pdd_sigmas)
+         sigma_values = torch.tensor(sigmas, dtype=torch.float32, device=self.device)
+         deltas = sigma_values[:-1] - sigma_values[1:]
++        if prof is not None:
++            prof.mark("denoise_setup")
+         with self.progress_bar(total=num_steps) as progress_bar:
+             for step in range(num_steps):
+                 check_request_cancellation()
+@@ -720,6 +751,8 @@ class MiniMaxH3ImagePipeline(
+                 kwargs["skip_mask_out_condition"] = True
+                 velocity, _ = self.transformer(pdd_step=step, **kwargs)
+                 _euler_target_step(video_rows, velocity, n_cond, deltas[step])
++                if prof is not None:
++                    prof.mark(f"step_{step}")
+                 progress_bar.update()
+         return video_rows[n_cond:]
+ 
+@@ -728,6 +761,7 @@ class MiniMaxH3ImagePipeline(
+     @torch.no_grad()
+     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
+         check_request_cancellation()
++        prof = _H3Prof()
+         parsed = self._parse_request(request)
+         canvas_w, canvas_h = parsed["canvas"]
+         latent_h, latent_w = canvas_h // 16, canvas_w // 16
+@@ -749,7 +783,9 @@ class MiniMaxH3ImagePipeline(
+         )
+ 
+         check_request_cancellation()
++        prof.mark("prepare")
+         hidden, text_tags = self._encode_text(parsed["prompt"], references)
++        prof.mark("text_encode")
+         # DLO keeps resident DiT layers on the host outside the denoise loop.
+         with self._resident_dit_layers_on_device():
+             target = self._denoise(
+@@ -761,6 +797,7 @@ class MiniMaxH3ImagePipeline(
+                 latent_h=latent_h,
+                 latent_w=latent_w,
+                 num_steps=parsed["steps"],
++                prof=prof,
+             )
+         latent = minimax_h3_unpatchify_video_tokens(
+             target.float(), latent_shape=(1, latent_h // 2, latent_w // 2, _LATENT_CHANNELS), patch_size=_PATCH
+@@ -768,14 +805,19 @@ class MiniMaxH3ImagePipeline(
+         if parsed["output_type"] == "latent":
+             return DiffusionOutput(output=latent)
+         check_request_cancellation()
++        prof.mark("unpatchify")
+         pixels = self.vae.decode_latent(latent, group=self._vae_group, use_cuda_graph=self._vae_cuda_graph)
++        prof.mark("vae_decode")
+         # Quantize on the device (the same FP32 arithmetic as on the host) so
+         # only uint8 bytes cross to the host.
+         pixels = minimax_h3_quantize_image(pixels)
+         if (canvas_w, canvas_h) != (parsed["width"], parsed["height"]):
+             pixels = minimax_h3_resize_image_output(pixels, parsed["width"], parsed["height"])
+         # Hand the host uint8 HWC images: the writer needs no layout copy.
++        prof.mark("quantize_resize")
+         pixels = pixels.permute(0, 2, 3, 1).contiguous().cpu()
++        prof.mark("d2h")
++        prof.dump(canvas=[canvas_w, canvas_h], size=[parsed["width"], parsed["height"]])
+         return DiffusionOutput(output=pixels)
+ 
+ 
+diff --git a/vllm_omni/entrypoints/openai/api_server.py b/vllm_omni/entrypoints/openai/api_server.py
+index 77f6f4ba5..423188377 100644
+--- a/vllm_omni/entrypoints/openai/api_server.py
++++ b/vllm_omni/entrypoints/openai/api_server.py
+@@ -2294,6 +2294,7 @@ async def generate_images(
+     Raises:
+         HTTPException: For validation errors, missing engine, or generation failures
+     """
++    _h3_t_handler_start = time.time()  # H3_PROF
+     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
+     # Get engine client (AsyncOmni) from app state
+     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+@@ -2473,23 +2474,32 @@ async def generate_images(
+                 detail="No output generated from multi-stage pipeline.",
+             )
+ 
++        _h3_t_engine_done = time.time()  # H3_PROF
+         # Extract images from result
+         images = _extract_images_from_result(result)
++        _h3_t_extract = time.time()  # H3_PROF
+ 
+         logger.debug(f"Successfully generated {len(images)} image(s)")
+ 
+         stage_durations = getattr(result, "stage_durations", None)
+         peak_memory_mb = getattr(result, "peak_memory_mb", None)
+         response_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
+-        return _image_json_response(
+-            _build_image_generation_response(
+-                images=images,
+-                request=request,
+-                stage_durations=stage_durations,
+-                peak_memory_mb=peak_memory_mb,
+-                response_metrics=response_metrics,
+-            )
++        _h3_built = _build_image_generation_response(
++            images=images,
++            request=request,
++            stage_durations=stage_durations,
++            peak_memory_mb=peak_memory_mb,
++            response_metrics=response_metrics,
+         )
++        _h3_t_encoded = time.time()  # H3_PROF: PNG encode + base64
++        _h3_resp = _image_json_response(_h3_built)
++        if os.environ.get("H3_PROF_FILE"):  # H3_PROF
++            with open(os.environ["H3_PROF_FILE"], "a") as _f:
++                _f.write(json.dumps({"kind": "api", "t_request_arrival": request_timestamp,
++                                     "t_handler_start": _h3_t_handler_start, "t_engine_done": _h3_t_engine_done,
++                                     "t_extract": _h3_t_extract, "t_encoded": _h3_t_encoded,
++                                     "t_json": time.time()}) + "\n")
++        return _h3_resp
+ 
+     except (EngineGenerateError, EngineDeadError) as exc:
+         return _create_engine_error_json_response(raw_request, exc)

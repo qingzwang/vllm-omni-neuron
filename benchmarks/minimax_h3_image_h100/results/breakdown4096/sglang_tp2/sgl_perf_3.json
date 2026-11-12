@@ -1,0 +1,103 @@
+{
+  "timestamp": "2026-11-12T08:55:40.327327+00:00",
+  "request_id": "2db38c7b-75a1-43e1-820d-32e315639c20",
+  "commit_hash": "12b727d3efd731e1ee91128644fffcb87557476e",
+  "tag": "server_perf_dump",
+  "total_duration_ms": 5634.545711999635,
+  "steps": [
+    {
+      "name": "MiniMaxH3PartitionAdmissionStage",
+      "duration_ms": 0.023180999960459303
+    },
+    {
+      "name": "MiniMaxH3TextEncodingStage",
+      "duration_ms": 82.12485800004288
+    },
+    {
+      "name": "MiniMaxH3VisualEncodingStage",
+      "duration_ms": 0.029240999992907746
+    },
+    {
+      "name": "MiniMaxH3LatentPreparationStage",
+      "duration_ms": 7.100796000031551
+    },
+    {
+      "name": "MiniMaxH3TimestepPreparationStage",
+      "duration_ms": 0.10520500018174062
+    },
+    {
+      "name": "MiniMaxH3DenoisingStage",
+      "duration_ms": 5236.832484000388
+    },
+    {
+      "name": "MiniMaxH3DecodingStage",
+      "duration_ms": 279.22248100003344
+    }
+  ],
+  "denoise_steps_ms": [
+    {
+      "step": 0,
+      "duration_ms": 846.8198579998898
+    },
+    {
+      "step": 1,
+      "duration_ms": 865.9296780001569
+    },
+    {
+      "step": 2,
+      "duration_ms": 873.6759149996942
+    },
+    {
+      "step": 3,
+      "duration_ms": 874.0127109999776
+    },
+    {
+      "step": 4,
+      "duration_ms": 872.6023519998307
+    },
+    {
+      "step": 5,
+      "duration_ms": 872.6067729999158
+    }
+  ],
+  "memory_checkpoints": {
+    "before_forward": {
+      "allocated_mb": 47492.65,
+      "reserved_mb": 47610.0,
+      "peak_allocated_mb": 47492.65,
+      "peak_reserved_mb": 47610.0,
+      "peak_host_anon_mb": 2421.32
+    },
+    "after_forward": {
+      "allocated_mb": 47498.65,
+      "reserved_mb": 50008.0,
+      "peak_allocated_mb": 48813.58,
+      "peak_reserved_mb": 50008.0,
+      "peak_host_anon_mb": 2421.32
+    },
+    "load_peak": {
+      "allocated_mb": 47498.65,
+      "reserved_mb": 50008.0,
+      "peak_allocated_mb": 48989.67,
+      "peak_reserved_mb": 49098.0,
+      "peak_host_anon_mb": 2421.32
+    },
+    "runtime_peak": {
+      "allocated_mb": 47498.65,
+      "reserved_mb": 50008.0,
+      "peak_allocated_mb": 48813.58,
+      "peak_reserved_mb": 50444.0,
+      "peak_host_anon_mb": 2421.32
+    },
+    "warmup_peak": {
+      "allocated_mb": 47498.65,
+      "reserved_mb": 50008.0,
+      "peak_allocated_mb": 48813.58,
+      "peak_reserved_mb": 48446.0,
+      "peak_host_anon_mb": 2421.32
+    }
+  },
+  "meta": {
+    "model": "MiniMaxAI/MiniMax-H3-Image"
+  }
+}

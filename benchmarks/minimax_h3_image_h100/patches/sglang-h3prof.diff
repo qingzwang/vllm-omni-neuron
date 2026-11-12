@@ -1,0 +1,97 @@
+diff --git a/python/sglang/multimodal_gen/runtime/entrypoints/openai/image_api.py b/python/sglang/multimodal_gen/runtime/entrypoints/openai/image_api.py
+index bf5f9f0ca3..23c7cd3815 100644
+--- a/python/sglang/multimodal_gen/runtime/entrypoints/openai/image_api.py
++++ b/python/sglang/multimodal_gen/runtime/entrypoints/openai/image_api.py
+@@ -232,6 +232,7 @@ async def generations(
+     request: ImageGenerationsRequest,
+     raw_request: Request,
+ ):
++    _h3_t_handler_start = time.time()  # H3_PROF
+     request_id = generate_request_id()
+     server_args = get_global_server_args()
+     sampling_params_cls = resolve_sampling_params_cls(server_args)
+@@ -314,9 +315,11 @@ async def generations(
+         if request.diffusers_kwargs:
+             batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
+ 
++        _h3_t_submit = time.time()  # H3_PROF
+         save_file_path_list, result = await process_generation_batch(
+             async_scheduler_client, batch
+         )
++        _h3_t_result = time.time()  # H3_PROF
+         save_file_path = save_file_path_list[0]
+         response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
+ 
+@@ -325,6 +328,7 @@ async def generations(
+             if resp_format == "b64_json"
+             else None
+         )
++        _h3_t_b64 = time.time()  # H3_PROF
+ 
+         is_persistent = server_args.output_path is not None
+         cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
+@@ -365,7 +369,15 @@ async def generations(
+             resize=response_resize,
+         )
+ 
+-    return ImageResponse(**response_kwargs)
++    _h3_resp = ImageResponse(**response_kwargs)
++    if os.environ.get("H3_PROF_FILE"):  # H3_PROF
++        import json as _json
++
++        with open(os.environ["H3_PROF_FILE"], "a") as _f:
++            _f.write(_json.dumps({"kind": "api", "t_handler_start": _h3_t_handler_start,
++                                  "t_submit": _h3_t_submit, "t_result": _h3_t_result,
++                                  "t_b64": _h3_t_b64, "t_return": time.time()}) + "\n")
++    return _h3_resp
+ 
+ 
+ @router.post("/edits", response_model=ImageResponse)
+diff --git a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+index a88f7b4bc7..1a9a3ff0dd 100644
+--- a/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
++++ b/python/sglang/multimodal_gen/runtime/managers/gpu_worker.py
+@@ -2,6 +2,7 @@
+ 
+ # SPDX-License-Identifier: Apache-2.0
+ import gc
++import json
+ import logging
+ import multiprocessing as mp
+ import os
+@@ -622,14 +623,31 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
+             request_gc.mark_warmup()
+         if req.is_warmup and req.extra.get("auto_residency_full_shape_probe"):
+             self._fit_auto_residency_probe(req)
++        # H3_PROF: wall-clock markers around pipeline forward and output encoding
++        def _h3_rec(kind, t0):
++            if os.environ.get("H3_PROF_FILE") and self.is_output_rank and not warming_up:
++                with open(os.environ["H3_PROF_FILE"], "a") as _f:
++                    _f.write(json.dumps({"kind": kind, "t0": t0, "t1": time.time()}) + "\n")
++
++        def _h3_forward():
++            _t0 = time.time()
++            _r = self.pipeline.forward(req, self.server_args)
++            if torch.cuda.is_available() and os.environ.get("H3_PROF_FILE"):
++                torch.cuda.synchronize()
++            _h3_rec("worker_forward", _t0)
++            return _r
++
++        def _h3_save(output_batch):
++            _t0 = time.time()
++            self._save_output_paths(req, output_batch)
++            _h3_rec("worker_save_outputs", _t0)
++
+         result = self._execute_forward_common(
+             req,
+-            forward_fn=lambda: self.pipeline.forward(req, self.server_args),
++            forward_fn=_h3_forward,
+             log_reqs=[req],
+             return_req=return_req,
+-            save_output_paths=lambda output_batch: self._save_output_paths(
+-                req, output_batch
+-            ),
++            save_output_paths=_h3_save,
+             error_context=f"request {req.request_id}",
+             defer_finalize=defer_finalize,
+         )

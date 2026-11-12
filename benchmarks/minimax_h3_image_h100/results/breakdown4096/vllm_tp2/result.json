@@ -1,0 +1,528 @@
+{
+ "framework": "vllm",
+ "size": "4096x4096",
+ "iters": 5,
+ "e2e_median_s": 6.59747838973999,
+ "row_medians_s": {
+  "client -> API handler (HTTP + request parsing)": 0.0009777545928955078,
+  "API -> engine -> GPU worker dispatch": 0.0025942325592041016,
+  "request parsing + noise generation (CPU)": 0.015358924865722656,
+  "text encoder (Qwen3-VL, TP2)": 0.0677788257598877,
+  "DiT packing / RoPE table prep": 0.002360820770263672,
+  "DiT denoise step_0": 0.8589823246002197,
+  "DiT denoise step_1": 0.8842077255249023,
+  "DiT denoise step_2": 0.8892943859100342,
+  "DiT denoise step_3": 0.8902850151062012,
+  "DiT denoise step_4": 0.8881621360778809,
+  "DiT denoise step_5": 0.888035774230957,
+  "latent unpatchify": 0.0002989768981933594,
+  "VAE decode (tiled, 2 GPUs)": 0.5576834678649902,
+  "quantize to uint8": 0.0004475116729736328,
+  "GPU -> CPU copy (uint8 image)": 0.028932571411132812,
+  "worker -> API process (IPC transfer + PIL conversion)": 0.11524415016174316,
+  "extract images": 6.198883056640625e-06,
+  "PNG encode + base64 (API process)": 0.16555190086364746,
+  "JSON serialize (orjson)": 0.03430819511413574,
+  "response send -> client headers": 0.005102872848510742,
+  "client body download": 0.0765998363494873,
+  "client JSON parse": 0.12052106857299805,
+  "client base64 decode": 0.10416102409362793
+ },
+ "runs": [
+  {
+   "e2e_s": 6.599333047866821,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0008342266082763672
+    ],
+    [
+     "API -> engine -> GPU worker dispatch",
+     0.002889871597290039
+    ],
+    [
+     "request parsing + noise generation (CPU)",
+     0.01531219482421875
+    ],
+    [
+     "text encoder (Qwen3-VL, TP2)",
+     0.06827449798583984
+    ],
+    [
+     "DiT packing / RoPE table prep",
+     0.0023682117462158203
+    ],
+    [
+     "DiT denoise step_0",
+     0.8525466918945312
+    ],
+    [
+     "DiT denoise step_1",
+     0.8865699768066406
+    ],
+    [
+     "DiT denoise step_2",
+     0.8868753910064697
+    ],
+    [
+     "DiT denoise step_3",
+     0.888314962387085
+    ],
+    [
+     "DiT denoise step_4",
+     0.8882186412811279
+    ],
+    [
+     "DiT denoise step_5",
+     0.887624979019165
+    ],
+    [
+     "latent unpatchify",
+     0.0003254413604736328
+    ],
+    [
+     "VAE decode (tiled, 2 GPUs)",
+     0.5538825988769531
+    ],
+    [
+     "quantize to uint8",
+     0.0004496574401855469
+    ],
+    [
+     "GPU -> CPU copy (uint8 image)",
+     0.028775453567504883
+    ],
+    [
+     "worker -> API process (IPC transfer + PIL conversion)",
+     0.12970423698425293
+    ],
+    [
+     "extract images",
+     6.198883056640625e-06
+    ],
+    [
+     "PNG encode + base64 (API process)",
+     0.16447663307189941
+    ],
+    [
+     "JSON serialize (orjson)",
+     0.03432297706604004
+    ],
+    [
+     "response send -> client headers",
+     0.0052869319915771484
+    ],
+    [
+     "client body download",
+     0.07767701148986816
+    ],
+    [
+     "client JSON parse",
+     0.12043523788452148
+    ],
+    [
+     "client base64 decode",
+     0.10416102409362793
+    ]
+   ],
+   "response_mb": 67.119899,
+   "png_mb": 50.339724
+  },
+  {
+   "e2e_s": 6.6013383865356445,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0011086463928222656
+    ],
+    [
+     "API -> engine -> GPU worker dispatch",
+     0.002784252166748047
+    ],
+    [
+     "request parsing + noise generation (CPU)",
+     0.015491724014282227
+    ],
+    [
+     "text encoder (Qwen3-VL, TP2)",
+     0.06763958930969238
+    ],
+    [
+     "DiT packing / RoPE table prep",
+     0.0023674964904785156
+    ],
+    [
+     "DiT denoise step_0",
+     0.8589823246002197
+    ],
+    [
+     "DiT denoise step_1",
+     0.8842077255249023
+    ],
+    [
+     "DiT denoise step_2",
+     0.889812707901001
+    ],
+    [
+     "DiT denoise step_3",
+     0.8909485340118408
+    ],
+    [
+     "DiT denoise step_4",
+     0.8844735622406006
+    ],
+    [
+     "DiT denoise step_5",
+     0.8846468925476074
+    ],
+    [
+     "latent unpatchify",
+     0.0002949237823486328
+    ],
+    [
+     "VAE decode (tiled, 2 GPUs)",
+     0.5613608360290527
+    ],
+    [
+     "quantize to uint8",
+     0.0004475116729736328
+    ],
+    [
+     "GPU -> CPU copy (uint8 image)",
+     0.029108762741088867
+    ],
+    [
+     "worker -> API process (IPC transfer + PIL conversion)",
+     0.1215217113494873
+    ],
+    [
+     "extract images",
+     5.4836273193359375e-06
+    ],
+    [
+     "PNG encode + base64 (API process)",
+     0.16555190086364746
+    ],
+    [
+     "JSON serialize (orjson)",
+     0.03394579887390137
+    ],
+    [
+     "response send -> client headers",
+     0.005102872848510742
+    ],
+    [
+     "client body download",
+     0.0765998363494873
+    ],
+    [
+     "client JSON parse",
+     0.12052106857299805
+    ],
+    [
+     "client base64 decode",
+     0.10441422462463379
+    ]
+   ],
+   "response_mb": 67.119898,
+   "png_mb": 50.339724
+  },
+  {
+   "e2e_s": 6.584370851516724,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0009632110595703125
+    ],
+    [
+     "API -> engine -> GPU worker dispatch",
+     0.0025942325592041016
+    ],
+    [
+     "request parsing + noise generation (CPU)",
+     0.015358924865722656
+    ],
+    [
+     "text encoder (Qwen3-VL, TP2)",
+     0.0677788257598877
+    ],
+    [
+     "DiT packing / RoPE table prep",
+     0.002360820770263672
+    ],
+    [
+     "DiT denoise step_0",
+     0.8598921298980713
+    ],
+    [
+     "DiT denoise step_1",
+     0.8804230690002441
+    ],
+    [
+     "DiT denoise step_2",
+     0.892141580581665
+    ],
+    [
+     "DiT denoise step_3",
+     0.8875720500946045
+    ],
+    [
+     "DiT denoise step_4",
+     0.8859207630157471
+    ],
+    [
+     "DiT denoise step_5",
+     0.8886139392852783
+    ],
+    [
+     "latent unpatchify",
+     0.00030541419982910156
+    ],
+    [
+     "VAE decode (tiled, 2 GPUs)",
+     0.5587236881256104
+    ],
+    [
+     "quantize to uint8",
+     0.00044536590576171875
+    ],
+    [
+     "GPU -> CPU copy (uint8 image)",
+     0.028224468231201172
+    ],
+    [
+     "worker -> API process (IPC transfer + PIL conversion)",
+     0.10100150108337402
+    ],
+    [
+     "extract images",
+     6.4373016357421875e-06
+    ],
+    [
+     "PNG encode + base64 (API process)",
+     0.16802096366882324
+    ],
+    [
+     "JSON serialize (orjson)",
+     0.034874677658081055
+    ],
+    [
+     "response send -> client headers",
+     0.005802631378173828
+    ],
+    [
+     "client body download",
+     0.07879114151000977
+    ],
+    [
+     "client JSON parse",
+     0.12053418159484863
+    ],
+    [
+     "client base64 decode",
+     0.10402083396911621
+    ]
+   ],
+   "response_mb": 67.119898,
+   "png_mb": 50.339724
+  },
+  {
+   "e2e_s": 6.594095706939697,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0009777545928955078
+    ],
+    [
+     "API -> engine -> GPU worker dispatch",
+     0.0025539398193359375
+    ],
+    [
+     "request parsing + noise generation (CPU)",
+     0.015290260314941406
+    ],
+    [
+     "text encoder (Qwen3-VL, TP2)",
+     0.06831693649291992
+    ],
+    [
+     "DiT packing / RoPE table prep",
+     0.0023467540740966797
+    ],
+    [
+     "DiT denoise step_0",
+     0.8587193489074707
+    ],
+    [
+     "DiT denoise step_1",
+     0.8852109909057617
+    ],
+    [
+     "DiT denoise step_2",
+     0.8892943859100342
+    ],
+    [
+     "DiT denoise step_3",
+     0.8902850151062012
+    ],
+    [
+     "DiT denoise step_4",
+     0.8881621360778809
+    ],
+    [
+     "DiT denoise step_5",
+     0.888035774230957
+    ],
+    [
+     "latent unpatchify",
+     0.0002987384796142578
+    ],
+    [
+     "VAE decode (tiled, 2 GPUs)",
+     0.5576834678649902
+    ],
+    [
+     "quantize to uint8",
+     0.00044727325439453125
+    ],
+    [
+     "GPU -> CPU copy (uint8 image)",
+     0.028932571411132812
+    ],
+    [
+     "worker -> API process (IPC transfer + PIL conversion)",
+     0.11524415016174316
+    ],
+    [
+     "extract images",
+     5.9604644775390625e-06
+    ],
+    [
+     "PNG encode + base64 (API process)",
+     0.16312766075134277
+    ],
+    [
+     "JSON serialize (orjson)",
+     0.034166812896728516
+    ],
+    [
+     "response send -> client headers",
+     0.004925727844238281
+    ],
+    [
+     "client body download",
+     0.07577395439147949
+    ],
+    [
+     "client JSON parse",
+     0.12014102935791016
+    ],
+    [
+     "client base64 decode",
+     0.10415506362915039
+    ]
+   ],
+   "response_mb": 67.119899,
+   "png_mb": 50.339724
+  },
+  {
+   "e2e_s": 6.59747838973999,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0010533332824707031
+    ],
+    [
+     "API -> engine -> GPU worker dispatch",
+     0.0025556087493896484
+    ],
+    [
+     "request parsing + noise generation (CPU)",
+     0.015418767929077148
+    ],
+    [
+     "text encoder (Qwen3-VL, TP2)",
+     0.06775522232055664
+    ],
+    [
+     "DiT packing / RoPE table prep",
+     0.0023505687713623047
+    ],
+    [
+     "DiT denoise step_0",
+     0.8635940551757812
+    ],
+    [
+     "DiT denoise step_1",
+     0.8832190036773682
+    ],
+    [
+     "DiT denoise step_2",
+     0.8892240524291992
+    ],
+    [
+     "DiT denoise step_3",
+     0.8924779891967773
+    ],
+    [
+     "DiT denoise step_4",
+     0.8926589488983154
+    ],
+    [
+     "DiT denoise step_5",
+     0.8909976482391357
+    ],
+    [
+     "latent unpatchify",
+     0.0002989768981933594
+    ],
+    [
+     "VAE decode (tiled, 2 GPUs)",
+     0.5553245544433594
+    ],
+    [
+     "quantize to uint8",
+     0.0004482269287109375
+    ],
+    [
+     "GPU -> CPU copy (uint8 image)",
+     0.02916407585144043
+    ],
+    [
+     "worker -> API process (IPC transfer + PIL conversion)",
+     0.10023117065429688
+    ],
+    [
+     "extract images",
+     7.152557373046875e-06
+    ],
+    [
+     "PNG encode + base64 (API process)",
+     0.16725945472717285
+    ],
+    [
+     "JSON serialize (orjson)",
+     0.03430819511413574
+    ],
+    [
+     "response send -> client headers",
+     0.004932880401611328
+    ],
+    [
+     "client body download",
+     0.07604241371154785
+    ],
+    [
+     "client JSON parse",
+     0.12259244918823242
+    ],
+    [
+     "client base64 decode",
+     0.10556364059448242
+    ]
+   ],
+   "response_mb": 67.119898,
+   "png_mb": 50.339724
+  }
+ ]
+}

@@ -1,0 +1,390 @@
+{
+ "1024_native": {
+  "size": "1024x1024",
+  "native_canvas": true,
+  "latencies_s": [
+   0.5696186850000231,
+   0.5680172369998218,
+   0.5680673789997854,
+   0.5736979940002129,
+   0.5702467750002143
+  ],
+  "median_s": 0.5696186850000231,
+  "mean_s": 0.5699296140000115,
+  "min_s": 0.5680172369998218,
+  "max_s": 0.5736979940002129,
+  "png_mb": 3.14706,
+  "image_size": [
+   1024,
+   1024
+  ],
+  "server_extra": [
+   {
+    "created": 1794472796,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2592230002846918,
+      "stage_0_gen_ms": 554.973840713501
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472797,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.25817300002017873,
+      "stage_0_gen_ms": 553.7223815917969
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472797,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2559530003054533,
+      "stage_0_gen_ms": 554.110050201416
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472798,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2191309999943769,
+      "stage_0_gen_ms": 559.685230255127
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472798,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2432520000184013,
+      "stage_0_gen_ms": 556.3139915466309
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   }
+  ]
+ },
+ "1024_default": {
+  "size": "1024x1024",
+  "native_canvas": false,
+  "latencies_s": [
+   1.379896379999991,
+   1.3830506939998486,
+   1.3797338019999188,
+   1.3803923539999232,
+   1.3818479149999803
+  ],
+  "median_s": 1.3803923539999232,
+  "mean_s": 1.3809842289999323,
+  "min_s": 1.3797338019999188,
+  "max_s": 1.3830506939998486,
+  "png_mb": 3.14706,
+  "image_size": [
+   1024,
+   1024
+  ],
+  "server_extra": [
+   {
+    "created": 1794472685,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2729030002228683,
+      "stage_0_gen_ms": 1365.7946586608887
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472686,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.19079899993812433,
+      "stage_0_gen_ms": 1368.67356300354
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472688,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.30126499996185885,
+      "stage_0_gen_ms": 1365.2160167694092
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472689,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.273854000170104,
+      "stage_0_gen_ms": 1365.6811714172363
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472690,
+    "output_format": "png",
+    "size": "1024x1024",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.25186199991367175,
+      "stage_0_gen_ms": 1367.2115802764893
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   }
+  ]
+ },
+ "2048": {
+  "size": "2048x2048",
+  "native_canvas": false,
+  "latencies_s": [
+   1.4499488100000235,
+   1.4544817299997703,
+   1.4558550880001349,
+   1.4500816659997326,
+   1.4529364059999352
+  ],
+  "median_s": 1.4529364059999352,
+  "mean_s": 1.4526607399999194,
+  "min_s": 1.4499488100000235,
+  "max_s": 1.4558550880001349,
+  "png_mb": 12.586,
+  "image_size": [
+   2048,
+   2048
+  ],
+  "server_extra": [
+   {
+    "created": 1794472695,
+    "output_format": "png",
+    "size": "2048x2048",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.20274000007702853,
+      "stage_0_gen_ms": 1379.364013671875
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472696,
+    "output_format": "png",
+    "size": "2048x2048",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.3216059999431309,
+      "stage_0_gen_ms": 1383.162021636963
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472698,
+    "output_format": "png",
+    "size": "2048x2048",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.25661200015747454,
+      "stage_0_gen_ms": 1382.300853729248
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472699,
+    "output_format": "png",
+    "size": "2048x2048",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.23824200025046594,
+      "stage_0_gen_ms": 1379.3368339538574
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472701,
+    "output_format": "png",
+    "size": "2048x2048",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2210210000157531,
+      "stage_0_gen_ms": 1381.8838596343994
+     },
+     "peak_memory_mb": 59790.0
+    },
+    "url": null,
+    "revised_prompt": null
+   }
+  ]
+ },
+ "4096": {
+  "size": "4096x4096",
+  "native_canvas": false,
+  "latencies_s": [
+   6.408143525000014,
+   6.378981923000083,
+   6.410901928000385,
+   6.3785698599999705,
+   6.4208631169999535
+  ],
+  "median_s": 6.408143525000014,
+  "mean_s": 6.399492070600081,
+  "min_s": 6.3785698599999705,
+  "max_s": 6.4208631169999535,
+  "png_mb": 50.339724,
+  "image_size": [
+   4096,
+   4096
+  ],
+  "server_extra": [
+   {
+    "created": 1794472721,
+    "output_format": "png",
+    "size": "4096x4096",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2570730002844357,
+      "stage_0_gen_ms": 6112.377405166626
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472727,
+    "output_format": "png",
+    "size": "4096x4096",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.23724199991193018,
+      "stage_0_gen_ms": 6118.793725967407
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472734,
+    "output_format": "png",
+    "size": "4096x4096",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2578019998509262,
+      "stage_0_gen_ms": 6115.14687538147
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472741,
+    "output_format": "png",
+    "size": "4096x4096",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2186710003115877,
+      "stage_0_gen_ms": 6119.543552398682
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   },
+   {
+    "created": 1794472747,
+    "output_format": "png",
+    "size": "4096x4096",
+    "cot_output": null,
+    "metrics": {
+     "stage_durations": {
+      "queue_wait_ms": 0.2366809999330144,
+      "stage_0_gen_ms": 6130.785942077637
+     },
+     "peak_memory_mb": 61998.0
+    },
+    "url": null,
+    "revised_prompt": null
+   }
+  ]
+ }
+}

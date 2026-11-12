@@ -1,0 +1,528 @@
+{
+ "framework": "sglang",
+ "size": "4096x4096",
+ "iters": 5,
+ "e2e_median_s": 6.387292385101318,
+ "row_medians_s": {
+  "client -> API handler (HTTP + request parsing)": 0.0012412071228027344,
+  "API: build request": 0.0004382133483886719,
+  "API -> scheduler -> GPU worker dispatch": 0.0029463768005371094,
+  "text encoder (Qwen3-VL, fold)": 0.07697905000031824,
+  "latent / noise preparation": 0.006750048999947467,
+  "DiT denoise setup (packing / RoPE / AdaLN plan)": 0.006497618000139482,
+  "DiT denoise step_0": 0.7967240950001724,
+  "DiT denoise step_1": 0.8355761480002002,
+  "DiT denoise step_2": 0.8343780650002373,
+  "DiT denoise step_3": 0.8290926669997134,
+  "DiT denoise step_4": 0.827839350999966,
+  "DiT denoise step_5": 0.8229237489999832,
+  "VAE decode (+ uint8, D2H)": 0.2816627619999963,
+  "pipeline overhead outside stages": 0.021766118782579724,
+  "worker: forward -> output encoding": 0.000629425048828125,
+  "PNG encode (GPU worker)": 0.24910640716552734,
+  "worker -> API process (IPC transfer)": 0.18463397026062012,
+  "base64 encode (API)": 0.12286591529846191,
+  "build response object": 0.0032041072845458984,
+  "JSON serialize + response send -> client headers": 0.17284822463989258,
+  "client body download": 0.07680797576904297,
+  "client JSON parse": 0.11786794662475586,
+  "client base64 decode": 0.10361838340759277
+ },
+ "runs": [
+  {
+   "e2e_s": 6.4072184562683105,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0012042522430419922
+    ],
+    [
+     "API: build request",
+     0.0004382133483886719
+    ],
+    [
+     "API -> scheduler -> GPU worker dispatch",
+     0.0027985572814941406
+    ],
+    [
+     "text encoder (Qwen3-VL, fold)",
+     0.09397495099983644
+    ],
+    [
+     "latent / noise preparation",
+     0.006694376999803353
+    ],
+    [
+     "DiT denoise setup (packing / RoPE / AdaLN plan)",
+     0.011887627999840333
+    ],
+    [
+     "DiT denoise step_0",
+     0.80285177199994
+    ],
+    [
+     "DiT denoise step_1",
+     0.8355761480002002
+    ],
+    [
+     "DiT denoise step_2",
+     0.8339348079998672
+    ],
+    [
+     "DiT denoise step_3",
+     0.8278825630000028
+    ],
+    [
+     "DiT denoise step_4",
+     0.827839350999966
+    ],
+    [
+     "DiT denoise step_5",
+     0.8185078460001023
+    ],
+    [
+     "VAE decode (+ uint8, D2H)",
+     0.28317737199995463
+    ],
+    [
+     "pipeline overhead outside stages",
+     0.021766118782579724
+    ],
+    [
+     "worker: forward -> output encoding",
+     0.0006151199340820312
+    ],
+    [
+     "PNG encode (GPU worker)",
+     0.25894975662231445
+    ],
+    [
+     "worker -> API process (IPC transfer)",
+     0.18463397026062012
+    ],
+    [
+     "base64 encode (API)",
+     0.12119269371032715
+    ],
+    [
+     "build response object",
+     0.003098011016845703
+    ],
+    [
+     "JSON serialize + response send -> client headers",
+     0.1730644702911377
+    ],
+    [
+     "client body download",
+     0.07535767555236816
+    ],
+    [
+     "client JSON parse",
+     0.11834955215454102
+    ],
+    [
+     "client base64 decode",
+     0.10328555107116699
+    ]
+   ],
+   "response_mb": 67.121422,
+   "png_mb": 50.339652
+  },
+  {
+   "e2e_s": 6.387292385101318,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0012412071228027344
+    ],
+    [
+     "API: build request",
+     0.00042176246643066406
+    ],
+    [
+     "API -> scheduler -> GPU worker dispatch",
+     0.0037539005279541016
+    ],
+    [
+     "text encoder (Qwen3-VL, fold)",
+     0.0766321619998962
+    ],
+    [
+     "latent / noise preparation",
+     0.00679959199987934
+    ],
+    [
+     "DiT denoise setup (packing / RoPE / AdaLN plan)",
+     0.006863632999284164
+    ],
+    [
+     "DiT denoise step_0",
+     0.8146659090002686
+    ],
+    [
+     "DiT denoise step_1",
+     0.8383019210000384
+    ],
+    [
+     "DiT denoise step_2",
+     0.8344401520002975
+    ],
+    [
+     "DiT denoise step_3",
+     0.8290354480000133
+    ],
+    [
+     "DiT denoise step_4",
+     0.8280647020001197
+    ],
+    [
+     "DiT denoise step_5",
+     0.8233904740000071
+    ],
+    [
+     "VAE decode (+ uint8, D2H)",
+     0.2815506329998243
+    ],
+    [
+     "pipeline overhead outside stages",
+     0.021741053665664367
+    ],
+    [
+     "worker: forward -> output encoding",
+     0.0006349086761474609
+    ],
+    [
+     "PNG encode (GPU worker)",
+     0.24176597595214844
+    ],
+    [
+     "worker -> API process (IPC transfer)",
+     0.18384552001953125
+    ],
+    [
+     "base64 encode (API)",
+     0.12286591529846191
+    ],
+    [
+     "build response object",
+     0.003277301788330078
+    ],
+    [
+     "JSON serialize + response send -> client headers",
+     0.1707763671875
+    ],
+    [
+     "client body download",
+     0.0762333869934082
+    ],
+    [
+     "client JSON parse",
+     0.11722850799560547
+    ],
+    [
+     "client base64 decode",
+     0.10361838340759277
+    ]
+   ],
+   "response_mb": 67.121422,
+   "png_mb": 50.339652
+  },
+  {
+   "e2e_s": 6.385416030883789,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.001262664794921875
+    ],
+    [
+     "API: build request",
+     0.0004608631134033203
+    ],
+    [
+     "API -> scheduler -> GPU worker dispatch",
+     0.0029463768005371094
+    ],
+    [
+     "text encoder (Qwen3-VL, fold)",
+     0.07656490899989876
+    ],
+    [
+     "latent / noise preparation",
+     0.0066896250000354485
+    ],
+    [
+     "DiT denoise setup (packing / RoPE / AdaLN plan)",
+     0.006497618000139482
+    ],
+    [
+     "DiT denoise step_0",
+     0.7967240950001724
+    ],
+    [
+     "DiT denoise step_1",
+     0.8415647090000675
+    ],
+    [
+     "DiT denoise step_2",
+     0.8357238570001755
+    ],
+    [
+     "DiT denoise step_3",
+     0.8321334949996526
+    ],
+    [
+     "DiT denoise step_4",
+     0.827072477999991
+    ],
+    [
+     "DiT denoise step_5",
+     0.8247735559998546
+    ],
+    [
+     "VAE decode (+ uint8, D2H)",
+     0.28867892600010236
+    ],
+    [
+     "pipeline overhead outside stages",
+     0.02243822143509533
+    ],
+    [
+     "worker: forward -> output encoding",
+     0.0005979537963867188
+    ],
+    [
+     "PNG encode (GPU worker)",
+     0.2425222396850586
+    ],
+    [
+     "worker -> API process (IPC transfer)",
+     0.18447542190551758
+    ],
+    [
+     "base64 encode (API)",
+     0.12413763999938965
+    ],
+    [
+     "build response object",
+     0.0031311511993408203
+    ],
+    [
+     "JSON serialize + response send -> client headers",
+     0.16827130317687988
+    ],
+    [
+     "client body download",
+     0.07709479331970215
+    ],
+    [
+     "client JSON parse",
+     0.11770439147949219
+    ],
+    [
+     "client base64 decode",
+     0.10380792617797852
+    ]
+   ],
+   "response_mb": 67.121422,
+   "png_mb": 50.339652
+  },
+  {
+   "e2e_s": 6.368001699447632,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0011990070343017578
+    ],
+    [
+     "API: build request",
+     0.0004487037658691406
+    ],
+    [
+     "API -> scheduler -> GPU worker dispatch",
+     0.002960205078125
+    ],
+    [
+     "text encoder (Qwen3-VL, fold)",
+     0.07697905000031824
+    ],
+    [
+     "latent / noise preparation",
+     0.006750048999947467
+    ],
+    [
+     "DiT denoise setup (packing / RoPE / AdaLN plan)",
+     0.006472476000453753
+    ],
+    [
+     "DiT denoise step_0",
+     0.7917087949999768
+    ],
+    [
+     "DiT denoise step_1",
+     0.8324476709999544
+    ],
+    [
+     "DiT denoise step_2",
+     0.8323534260002816
+    ],
+    [
+     "DiT denoise step_3",
+     0.8290926669997134
+    ],
+    [
+     "DiT denoise step_4",
+     0.8258437790000244
+    ],
+    [
+     "DiT denoise step_5",
+     0.8223688899997796
+    ],
+    [
+     "VAE decode (+ uint8, D2H)",
+     0.2788028539998777
+    ],
+    [
+     "pipeline overhead outside stages",
+     0.021536008200655488
+    ],
+    [
+     "worker: forward -> output encoding",
+     0.0006475448608398438
+    ],
+    [
+     "PNG encode (GPU worker)",
+     0.24910640716552734
+    ],
+    [
+     "worker -> API process (IPC transfer)",
+     0.19050216674804688
+    ],
+    [
+     "base64 encode (API)",
+     0.12313985824584961
+    ],
+    [
+     "build response object",
+     0.0032041072845458984
+    ],
+    [
+     "JSON serialize + response send -> client headers",
+     0.17284822463989258
+    ],
+    [
+     "client body download",
+     0.07816123962402344
+    ],
+    [
+     "client JSON parse",
+     0.11786794662475586
+    ],
+    [
+     "client base64 decode",
+     0.10340237617492676
+    ]
+   ],
+   "response_mb": 67.121422,
+   "png_mb": 50.339652
+  },
+  {
+   "e2e_s": 6.397843599319458,
+   "rows": [
+    [
+     "client -> API handler (HTTP + request parsing)",
+     0.0013241767883300781
+    ],
+    [
+     "API: build request",
+     0.0004258155822753906
+    ],
+    [
+     "API -> scheduler -> GPU worker dispatch",
+     0.002817392349243164
+    ],
+    [
+     "text encoder (Qwen3-VL, fold)",
+     0.07805213299980096
+    ],
+    [
+     "latent / noise preparation",
+     0.006768579999970825
+    ],
+    [
+     "DiT denoise setup (packing / RoPE / AdaLN plan)",
+     0.006373979000727559
+    ],
+    [
+     "DiT denoise step_0",
+     0.7935555159997421
+    ],
+    [
+     "DiT denoise step_1",
+     0.8336169579997659
+    ],
+    [
+     "DiT denoise step_2",
+     0.8343780650002373
+    ],
+    [
+     "DiT denoise step_3",
+     0.8326591710001594
+    ],
+    [
+     "DiT denoise step_4",
+     0.8307501179997416
+    ],
+    [
+     "DiT denoise step_5",
+     0.8229237489999832
+    ],
+    [
+     "VAE decode (+ uint8, D2H)",
+     0.2816627619999963
+    ],
+    [
+     "pipeline overhead outside stages",
+     0.022949374340441864
+    ],
+    [
+     "worker: forward -> output encoding",
+     0.000629425048828125
+    ],
+    [
+     "PNG encode (GPU worker)",
+     0.2567012310028076
+    ],
+    [
+     "worker -> API process (IPC transfer)",
+     0.18785500526428223
+    ],
+    [
+     "base64 encode (API)",
+     0.12202596664428711
+    ],
+    [
+     "build response object",
+     0.003240346908569336
+    ],
+    [
+     "JSON serialize + response send -> client headers",
+     0.17745327949523926
+    ],
+    [
+     "client body download",
+     0.07680797576904297
+    ],
+    [
+     "client JSON parse",
+     0.12105393409729004
+    ],
+    [
+     "client base64 decode",
+     0.10368537902832031
+    ]
+   ],
+   "response_mb": 67.121422,
+   "png_mb": 50.339652
+  }
+ ]
+}
