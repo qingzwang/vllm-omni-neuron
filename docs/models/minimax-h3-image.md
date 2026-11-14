@@ -118,6 +118,48 @@ python examples/minimax_h3_image/run.py \
 canvas of at least this area (default 2048x2048) and resized back. Pass `1024` to generate
 at the requested size.
 
+## Examples
+
+All images below were produced by this implementation on one Trn2 chip (16 NeuronCores,
+TP8 x CP2) with the default settings (BF16, no step cache). They are JPEG-compressed copies
+of the PNG outputs.
+
+**Text-to-image, 2048x2048** (1.56 s per request), seed 42:
+
+> A rustic, overhead shot of a farm-to-table feast, showcasing a variety of colorful,
+> seasonal vegetables, artisanal cheeses, and freshly baked bread on a weathered wooden table.
+
+![T2I 2048x2048](images/minimax-h3-image/t2i_2048.jpg)
+
+**Text-to-image, 4096x4096** (6.88 s per request), same prompt and seed. Left: the whole image,
+downscaled to 1024x1024. Right: a 1024x1024 crop at native resolution.
+
+| Full image (downscaled) | Native-resolution crop |
+| --- | --- |
+| ![T2I 4096x4096](images/minimax-h3-image/t2i_4096.jpg) | ![T2I 4096x4096 crop](images/minimax-h3-image/t2i_4096_crop.jpg) |
+
+**Neuron vs CPU reference.** Default prompt and seed at 2048x2048, against the diffusers CPU
+reference that the accuracy tiers below use:
+
+![Neuron vs CPU reference](images/minimax-h3-image/t2i_2048_neuron_vs_reference.jpg)
+
+**Single-reference edit** (2.89 s per request), seed 1234, 2048 canvas:
+
+> Take the over-ear headphones off the man on the left and fill in his hair where the band
+> flattened it. Have both hosts lean toward each other and fist-bump directly above the
+> "MONEY TALKS" desk sign, knuckles touching, elbows lifted off the desk, so the bump sits dead
+> centre between the two microphones.
+
+![Single-reference edit](images/minimax-h3-image/edit_single.jpg)
+
+**Three-reference edit** (9.13 s per request), seed 7, 2048 canvas:
+
+> Place the main subject of <Picture 2> into the environment of <Picture 3>, standing in the
+> foreground on the left. Next to them, add the main subject of <Picture 1>. Keep the lighting
+> and colour palette of <Picture 3>, photorealistic, highly detailed.
+
+![Three-reference edit](images/minimax-h3-image/edit_multi.jpg)
+
 ## Accuracy Evaluation
 
 **Method.** Three tiers against the diffusers 0.42 (main) CPU reference, same prompt,
